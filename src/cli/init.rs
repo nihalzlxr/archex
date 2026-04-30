@@ -97,12 +97,22 @@ fn detect_project_type(root: &Path) -> ProjectType {
 
 fn seed_nextjs_modules(db: &Db) -> usize {
     let modules = vec![
-        ("app", "ui", "app/**"),
-        ("components", "ui", "components/**"),
-        ("api", "api", "app/api/**"),
-        ("lib", "service", "lib/**"),
-        ("db", "db", "db/**"),
-        ("actions", "service", "actions/**"),
+        ("app", "ui", "src/app/**"),
+        ("components", "ui", "src/components/**"),
+        ("api", "api", "src/app/api/**"),
+        ("lib", "service", "src/lib/**"),
+        ("db", "db", "src/db/**"),
+        ("actions", "service", "src/actions/**"),
+        ("services", "service", "src/services/**"),
+        ("hooks", "ui", "src/hooks/**"),
+        ("utils", "service", "src/utils/**"),
+        ("types", "types", "src/types/**"),
+        ("middleware", "api", "src/middleware/**"),
+        ("jobs", "service", "src/jobs/**"),
+        ("validations", "service", "src/validations/**"),
+        ("models", "db", "src/models/**"),
+        ("server", "api", "src/server/**"),
+        ("libs", "service", "src/libs/**"),
     ];
 
     for (name, layer, pattern) in &modules {
