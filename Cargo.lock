@@ -97,6 +97,7 @@ dependencies = [
  "glob",
  "rmcp",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",

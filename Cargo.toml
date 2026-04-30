@@ -6,7 +6,8 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-rmcp = "0.4"
+rmcp = { version = "0.4", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1.0"
 tree-sitter = "0.23"
 tree-sitter-typescript = "0.23"
 serde = "1.0"
