@@ -17,11 +17,17 @@ enum Commands {
     Serve,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Init => cli::init::run(),
-        Commands::Serve => cli::serve::run(),
+        Commands::Serve => {
+            if let Err(e) = cli::serve::run().await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
