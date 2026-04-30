@@ -1,142 +1,84 @@
 use crate::core::db::{Db, RuleType};
-use rmcp::{
-    handler::server::tool::ToolRouter,
-    model::{CallToolResult, Content, ProtocolVersion, ServerCapabilities, ServerInfo},
-    tool, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
-};
-use serde::{Deserialize, Serialize};
-use rmcp::schemars::JsonSchema;
+use rmcp::{ServerHandler, ServiceExt, tool, Error as McpError};
+use rmcp::model::{CallToolResult, Content};
+use serde_json::{json, Value};
 use std::path::Path;
 
 const DB_PATH: &str = ".archex/db.sqlite";
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct GetContextInput {
-    pub file_path: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GetContextOutput {
-    pub found: bool,
-    pub message: Option<String>,
-    pub file: Option<String>,
-    pub module: Option<String>,
-    pub layer: Option<String>,
-    pub rules: Option<Vec<RuleOutput>>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RuleOutput {
-    pub rule_type: String,
-    pub description: String,
-    pub pattern: Option<String>,
-}
-
 #[derive(Clone)]
-pub struct ArchexService {
-    tool_router: ToolRouter<Self>,
-}
+pub struct ArchexService;
 
-impl ServerHandler for ArchexService {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            instructions: Some(
-                "Archex provides context about file module mappings. Use get_context with a file path to see which module a file belongs to and its rules.".to_string(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
-    }
-}
-
-#[tool_router]
+#[rmcp::tool(tool_box)]
 impl ArchexService {
-    pub fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
-    }
-
-    #[tool(description = "Get context for a file: its module, layer, and rules")]
-    fn get_context(
+    #[tool(description = "Get architecture context for a file")]
+    async fn get_context(
         &self,
-        params: rmcp::handler::server::tool::Parameters<GetContextInput>,
+        #[tool(param)]
+        #[schemars(description = "Relative file path from project root")]
+        file_path: String,
     ) -> Result<CallToolResult, McpError> {
-        let input = params.0;
         let db = match Db::open(Path::new(DB_PATH)) {
             Ok(db) => db,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&GetContextOutput {
-                        found: false,
-                        message: Some(format!("Failed to open database: {}", e)),
-                        file: None,
-                        module: None,
-                        layer: None,
-                        rules: None,
-                    })
-                    .unwrap(),
+                    serde_json::to_string(&json!({
+                        "found": false,
+                        "message": format!("Failed to open database: {}", e)
+                    })).unwrap()
                 )]));
             }
         };
 
-        match db.get_context_for_file(&input.file_path) {
+        match db.get_context_for_file(&file_path) {
             Ok(Some(ctx)) => {
-                let rules: Vec<RuleOutput> = ctx
+                let rules: Vec<Value> = ctx
                     .rules
                     .iter()
-                    .map(|r| RuleOutput {
-                        rule_type: match r.rule_type {
-                            RuleType::Forbidden => "forbidden".to_string(),
-                            RuleType::Required => "required".to_string(),
-                            RuleType::Warning => "warning".to_string(),
-                        },
-                        description: r.description.clone(),
-                        pattern: r.pattern.clone(),
+                    .map(|r| {
+                        json!({
+                            "rule_type": match r.rule_type {
+                                RuleType::Forbidden => "forbidden",
+                                RuleType::Required => "required",
+                                RuleType::Warning => "warning",
+                            },
+                            "description": r.description,
+                            "pattern": r.pattern
+                        })
                     })
                     .collect();
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&GetContextOutput {
-                        found: true,
-                        message: None,
-                        file: Some(input.file_path),
-                        module: Some(ctx.module_name),
-                        layer: Some(ctx.layer),
-                        rules: Some(rules),
-                    })
-                    .unwrap(),
+                    serde_json::to_string(&json!({
+                        "found": true,
+                        "file": file_path,
+                        "module": ctx.module_name,
+                        "layer": ctx.layer,
+                        "rules": rules
+                    })).unwrap()
                 )]))
             }
             Ok(None) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&GetContextOutput {
-                    found: false,
-                    message: Some("File not mapped. Run archex init.".to_string()),
-                    file: None,
-                    module: None,
-                    layer: None,
-                    rules: None,
-                })
-                .unwrap(),
+                serde_json::to_string(&json!({
+                    "found": false,
+                    "message": "File not mapped. Run archex init."
+                })).unwrap()
             )])),
             Err(e) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&GetContextOutput {
-                    found: false,
-                    message: Some(format!("Database error: {}", e)),
-                    file: None,
-                    module: None,
-                    layer: None,
-                    rules: None,
-                })
-                .unwrap(),
+                serde_json::to_string(&json!({
+                    "found": false,
+                    "message": format!("Database error: {}", e)
+                })).unwrap()
             )])),
         }
     }
 }
 
+#[rmcp::tool(tool_box)]
+impl ServerHandler for ArchexService {}
+
 pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
-    let service = ArchexService::new().serve(rmcp::transport::stdio()).await?;
+    let service = ArchexService.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
