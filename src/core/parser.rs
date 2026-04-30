@@ -27,7 +27,7 @@ impl Parser {
     pub fn scan(&self, project_root: &Path) -> Result<ScanResult, Box<dyn std::error::Error>> {
         let modules = self.db.get_all_modules().map_err(|e| format!("DB error: {}", e))?;
 
-        let compiled_patterns: Vec<(Module, Pattern)> = modules
+        let mut compiled_patterns: Vec<(Module, Pattern)> = modules
             .into_iter()
             .filter_map(|m| {
                 Pattern::new(&m.path_pattern)
@@ -35,6 +35,9 @@ impl Parser {
                     .map(|p| (m, p))
             })
             .collect();
+
+        // Sort by pattern length descending (most specific first)
+        compiled_patterns.sort_by(|a, b| b.1.as_str().len().cmp(&a.1.as_str().len()));
 
         let mut files_scanned = 0;
         let mut files_mapped = 0;

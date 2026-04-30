@@ -184,4 +184,8 @@ impl Db {
             rules,
         }))
     }
+
+    pub fn get_rule_count(&self) -> Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
+    }
 }
