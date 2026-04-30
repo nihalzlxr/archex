@@ -1,12 +1,11 @@
 use crate::core::db::{Db, RuleType};
-use std::future::Future;
 use rmcp::{
     handler::server::tool::ToolRouter,
     model::{CallToolResult, Content, ProtocolVersion, ServerCapabilities, ServerInfo},
     tool, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use schemars::JsonSchema;
+use rmcp::schemars::JsonSchema;
 use std::path::Path;
 
 const DB_PATH: &str = ".archex/db.sqlite";
@@ -60,7 +59,7 @@ impl ArchexService {
     }
 
     #[tool(description = "Get context for a file: its module, layer, and rules")]
-    async fn get_context(
+    fn get_context(
         &self,
         params: rmcp::handler::server::tool::Parameters<GetContextInput>,
     ) -> Result<CallToolResult, McpError> {
