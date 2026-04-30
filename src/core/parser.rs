@@ -50,6 +50,8 @@ impl Parser {
 
         eprintln!("Scanning {} files...", total_entries);
 
+        let project_root_str = project_root.to_string_lossy().to_lowercase();
+
         for entry in WalkDir::new(project_root)
             .into_iter()
             .filter_entry(|e| !Self::should_skip(e))
@@ -60,11 +62,19 @@ impl Parser {
             files_scanned += 1;
 
             let file_path = entry.path();
-            let relative_path = file_path
-                .strip_prefix(project_root)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let file_path_str = file_path.to_string_lossy();
+
+            let relative_path = if file_path_str.to_lowercase().starts_with(&project_root_str) {
+                file_path_str[project_root_str.len()..].trim_start_matches(['/', '\\'])
+            } else {
+                file_path_str.as_ref()
+            }.to_string();
+
+            let relative_path = relative_path.replace('\\', "/");
+
+            if relative_path.is_empty() {
+                continue;
+            }
 
             let matched_module = compiled_patterns
                 .iter()
@@ -74,7 +84,7 @@ impl Parser {
                 self.db.upsert_file(&relative_path, module.id)?;
                 files_mapped += 1;
             } else {
-                files_unmapped.push(file_path.to_path_buf());
+                files_unmapped.push(PathBuf::from(&relative_path));
             }
 
             if files_scanned % 50 == 0 {
