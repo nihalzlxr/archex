@@ -32,6 +32,14 @@ impl From<String> for RuleType {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct Module {
+    pub id: i64,
+    pub name: String,
+    pub layer: String,
+    pub path_pattern: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FileContext {
     pub module_name: String,
@@ -106,6 +114,21 @@ impl Db {
             (module_id, rule_type, description, pattern),
         )?;
         Ok(())
+    }
+
+    pub fn get_all_modules(&self) -> Result<Vec<Module>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, layer, path_pattern FROM modules")?;
+        let modules = stmt.query_map([], |row| {
+            Ok(Module {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                layer: row.get(2)?,
+                path_pattern: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(modules)
     }
 
     pub fn upsert_file(&self, file_path: &str, module_id: i64) -> Result<()> {
