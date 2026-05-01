@@ -138,12 +138,12 @@ impl ArchexService {
         &self,
         #[tool(aggr)] req: CreatePlanRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        let api_key = match std::env::var("OPENROUTER_API_KEY") {
             Ok(key) if !key.is_empty() => key,
             _ => {
                 return Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string(&serde_json::json!({
-                        "error": "ANTHROPIC_API_KEY environment variable not set"
+                        "error": "OPENROUTER_API_KEY environment variable not set"
                     })).unwrap()
                 )]));
             }
@@ -162,7 +162,7 @@ impl ArchexService {
         };
 
         // Extract keywords from feature
-        let stop_words = ["a", "an", "the", "to", "for", "in", "of", "with", "and", "or", "is", "are", "be", "have", "has", "that", "this", "it"];
+        let stop_words = ["a","an","the","to","for","in","of","with","and","or","is","it","that","this","on","at","by","from","be","as","are","was","were","will","have","has","had","do","does","did","but","not","we","i","you","they","he","she","its"];
         let keywords: Vec<String> = req.feature
             .split_whitespace()
             .map(|s| s.trim().to_lowercase())
@@ -184,36 +184,38 @@ impl ArchexService {
         // Build context string
         let context = modules.iter().map(|m| {
             format!(
-                "Module: {} (layer: {}, pattern: {})\n  Rules: {}\n",
+                "Module: {} | Layer: {} | Pattern: {}\n  Rules: {}",
                 m.name,
                 m.layer,
                 m.path_pattern,
                 m.rules.join("; ")
             )
-        }).collect::<Vec<_>>().join("\n");
+        }).collect::<Vec<_>>().join("\n\n");
 
         let system_prompt = format!(
-            "You are Archex, a senior software architect. You know this codebase structure:\n\n{}\n\nYou must generate a precise implementation plan for the requested feature. Always output valid JSON only, no markdown, no explanation.",
+            "You are Archex, a senior software architect. You know this codebase:\n\n{}\n\nGenerate implementation plans as JSON only. No markdown. No explanation. Only valid JSON.",
             context
         );
 
         let user_prompt = format!(
-            "Feature request: {}\n\nGenerate a plan with this exact JSON structure:\n{{\n  \"feature\": \"...\",\n  \"summary\": \"one line description\",\n  \"modules_involved\": [\"api\", \"services\", \"jobs\"],\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"action\": \"CREATE|MODIFY|DELETE\",\n      \"file_path\": \"src/services/fee-reminder.ts\",\n      \"description\": \"what to implement in this file\",\n      \"pattern_to_follow\": \"src/services/fee.ts\",\n      \"rules\": [\"no direct DB access\", \"validate inputs with zod\"]\n    }}\n  ],\n  \"security_checklist\": [\n    \"Validate all inputs with zod\",\n    \"Check authentication before data access\",\n    \"No secrets hardcoded\"\n  ],\n  \"estimated_files\": 4\n}}",
+            "Feature: {}\n\nRespond with this exact JSON structure:\n{{\n  \"feature\": \"...\",\n  \"summary\": \"one line description\",\n  \"modules_involved\": [\"module1\", \"module2\"],\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"action\": \"CREATE or MODIFY\",\n      \"file_path\": \"exact/path/from/codebase.ts\",\n      \"description\": \"what to implement\",\n      \"pattern_to_follow\": \"existing/similar/file.ts or null\",\n      \"rules\": [\"rule1\", \"rule2\"]\n    }}\n  ],\n  \"security_checklist\": [\n    \"Validate inputs with zod\",\n    \"Check auth before data access\"\n  ],\n  \"estimated_files\": 3\n}}",
             req.feature
         );
 
-        // Call Anthropic API
+        // Call OpenRouter API
         let client = reqwest::Client::new();
         let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://archex.dev")
+            .header("X-Title", "Archex")
             .json(&serde_json::json!({
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 4000,
-                "system": system_prompt,
+                "model": "qwen/qwen3-coder-480b-a35b-instruct:free",
+                "temperature": 0.3,
+                "response_format": { "type": "json_object" },
                 "messages": [
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ]
             }))
@@ -233,12 +235,21 @@ impl ArchexService {
                     }
                 };
 
-                if let Some(content) = json.get("content").and_then(|c| c.as_array()).and_then(|a| a.first()) {
-                    if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
-                        // Try to extract valid JSON from the response
-                        if let Ok(plan) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(content) = json.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(|t| t.as_str()) {
+                    // Try to parse as JSON
+                    match serde_json::from_str::<serde_json::Value>(content) {
+                        Ok(plan) => {
                             return Ok(CallToolResult::success(vec![Content::text(
                                 serde_json::to_string(&plan).unwrap()
+                            )]));
+                        }
+                        Err(_) => {
+                            // Return with warning
+                            return Ok(CallToolResult::success(vec![Content::text(
+                                serde_json::to_string(&serde_json::json!({
+                                    "warning": "could not parse as JSON",
+                                    "raw": content
+                                })).unwrap()
                             )]));
                         }
                     }
