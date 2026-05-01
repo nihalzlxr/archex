@@ -211,7 +211,7 @@ impl ArchexService {
             .header("HTTP-Referer", "https://archex.dev")
             .header("X-Title", "Archex")
             .json(&serde_json::json!({
-                "model": "qwen/qwen3-coder-480b-a35b-instruct:free",
+                "model": "google/gemma-3-27b-it:free",
                 "temperature": 0.3,
                 "response_format": { "type": "json_object" },
                 "messages": [
