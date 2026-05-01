@@ -227,7 +227,8 @@ impl Parser {
             "function_declaration" | "method_definition" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = Self::get_node_text(&name_node, content);
-                    let signature = Self::get_function_signature(node, content);
+                    let full_text = node.utf8_text(content.as_bytes()).unwrap_or_default();
+                    let signature = Self::extract_ts_function_signature(&full_text);
                     let line = node.start_position().row as i64 + 1;
                     
                     let symbol_type = if is_route_file { "route" } else { "function" };
@@ -297,9 +298,18 @@ impl Parser {
                     });
                 }
             }
-            "import_clause" => {
-                if let Some(import) = Self::extract_ts_import(node, content) {
-                    imports.push(import);
+            "import_statement" => {
+                let imported_from = Self::extract_ts_import_path(node, content);
+                let names = Self::extract_ts_imported_names(node, content);
+                
+                if !imported_from.is_empty() || !names.is_empty() {
+                    imports.push(Import {
+                        id: 0,
+                        file_path: file_path.to_string(),
+                        imported_from,
+                        imported_names: names,
+                        module_id,
+                    });
                 }
             }
             _ => {}
@@ -312,30 +322,230 @@ impl Parser {
         }
     }
 
+    fn extract_ts_import_path(node: &tree_sitter::Node, content: &str) -> String {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                let kind = child.kind();
+                if kind == "string" {
+                    let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if text.starts_with('"') {
+                        return text[1..text.len()-1].to_string();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
+    fn extract_ts_imported_names(node: &tree_sitter::Node, content: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        
+        fn visit(node: &tree_sitter::Node, content: &str, names: &mut Vec<String>) {
+            let kind = node.kind();
+            
+            if kind == "identifier" || kind == "property_identifier" {
+                let text = node.utf8_text(content.as_bytes()).unwrap_or_default();
+                if !text.is_empty() && !text.starts_with('"') && !text.starts_with('\'') {
+                    names.push(text.to_string());
+                }
+            }
+            
+            if kind == "import_specifier" {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        let child_kind = child.kind();
+                        if child_kind == "identifier" || child_kind == "property_identifier" {
+                            let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
+                            if !text.is_empty() {
+                                names.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if kind == "namespace_import" {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let text = name_node.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if !text.is_empty() {
+                        names.push(text.to_string());
+                    }
+                }
+            }
+            
+if kind == "default_import" {
+                let text = node.utf8_text(content.as_bytes()).unwrap_or_default();
+                if !text.is_empty() {
+                    names.push(text.trim().to_string());
+                }
+            }
+            
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    let child_ref = &child;
+                    visit(child_ref, content, names);
+                }
+            }
+        }
+        
+        let node_ref = node;
+        visit(node_ref, content, &mut names);
+        names
+    }
+
+    fn extract_ts_function_signature(node_text: &str) -> String {
+        if node_text.is_empty() {
+            return "()".to_string();
+        }
+        
+        let params_start = node_text.find('(');
+        let params_end = node_text.find(')');
+        
+        if params_start.is_none() || params_end.is_none() {
+            return "()".to_string();
+        }
+        
+        let params_text = &node_text[params_start.unwrap()+1..params_end.unwrap()];
+        
+        let return_start = node_text.find("): ");
+        let return_type = if let Some(pos) = return_start {
+            let rt = node_text[pos+3..].trim();
+            if rt.is_empty() { "" } else { rt }
+        } else {
+            ""
+        };
+        
+        let mut param_list = Vec::new();
+        let mut depth = 0;
+        let mut current = String::new();
+        
+        for ch in params_text.chars() {
+            if ch == '(' { depth += 1; current.push(ch); }
+            else if ch == ')' && depth > 0 { depth -= 1; current.push(ch); }
+            else if ch == ',' && depth == 0 {
+                param_list.push(current.trim().to_string());
+                current = String::new();
+            } else {
+                current.push(ch);
+            }
+        }
+        
+        if !current.trim().is_empty() {
+            param_list.push(current.trim().to_string());
+        }
+        
+        let formatted: Vec<String> = param_list.into_iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        
+        if formatted.is_empty() {
+            if return_type.is_empty() { "()".to_string() } 
+            else { format!("() => {}", return_type) }
+        } else {
+            if return_type.is_empty() { 
+                format!("({})", formatted.join(", ")) 
+            } else { 
+                format!("({}) => {}", formatted.join(", "), return_type) 
+            }
+        }
+    }
+
+    fn get_function_signature(node: &tree_sitter::Node, content: &str) -> String {
+        let full_text = node.utf8_text(content.as_bytes()).unwrap_or_default();
+        Self::extract_ts_function_signature(&full_text)
+    }
+
     fn extract_ts_import(node: &tree_sitter::Node, content: &str) -> Option<Import> {
         let mut imported_from = String::new();
         let mut imported_names = Vec::new();
         
-        if let Some(source_node) = node.child_by_field_name("source") {
-            let text = Self::get_node_text(&source_node, content);
-            if text.starts_with('"') || text.starts_with('\'') {
-                imported_from = text[1..text.len()-1].to_string();
+        fn collect_import_children(node: &tree_sitter::Node, content: &str, names: &mut Vec<String>) {
+            let kind = node.kind();
+            
+            if kind == "string" {
+                let text = node.utf8_text(content.as_bytes()).unwrap_or_default();
+                if text.starts_with('"') || text.starts_with('\'') {
+                    if let Some(parent) = node.parent() {
+                        if parent.kind() == "string" && parent.child_count() == 1 {
+                            return;
+                        }
+                    }
+                }
+            }
+            
+            if kind == "identifier" || kind == "property_identifier" {
+                let text = node.utf8_text(content.as_bytes()).unwrap_or_default();
+                if !text.is_empty() && !text.starts_with('"') && !text.starts_with('\'') {
+                    names.push(text.to_string());
+                }
+            } else if kind == "namespace_import" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let text = name.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if !text.is_empty() {
+                        names.push(text.to_string());
+                    }
+                }
+            } else if kind == "named_imports" {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        collect_import_children(&child, content, names);
+                    }
+                }
+            } else if kind == "import_specifier" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let text = name.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if !text.is_empty() {
+                        names.push(text.to_string());
+                    }
+                }
+                if let Some(alias) = node.child_by_field_name("alias") {
+                    let text = alias.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if !text.is_empty() {
+                        names.push(text.to_string());
+                    }
+                }
+            }
+            
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    collect_import_children(&child, content, names);
+                }
             }
         }
         
-        if let Some(module_ref) = node.child_by_field_name("module") {
-            imported_from = Self::get_node_text(&module_ref, content);
-        }
-        
-        if node.child_by_field_name("named_imports").is_some() || node.child(0).and_then(|n| n.child_by_field_name("default_import")).is_some() {
-            Self::collect_imported_names(node, content, &mut imported_names);
-        } else {
-            if let Some(default) = node.child_by_field_name("default_import") {
-                imported_names.push(Self::get_node_text(&default, content));
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                let kind = child.kind();
+                
+                if kind == "string" {
+                    let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if text.starts_with('"') && !imported_from.is_empty() == false {
+                        imported_from = text[1..text.len()-1].to_string();
+                    }
+                } else if kind == "module" {
+                    let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if !text.is_empty() && !text.starts_with('"') {
+                        imported_from = text.to_string();
+                    }
+                } else if kind == "named_imports" {
+                    collect_import_children(&child, content, &mut imported_names);
+                } else if kind == "namespace_import" {
+                    collect_import_children(&child, content, &mut imported_names);
+                } else if kind == "default_import" {
+                    let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
+                    if !text.is_empty() {
+                        imported_names.push(text.to_string());
+                    }
+                }
             }
         }
         
-        if !imported_from.is_empty() && !imported_names.is_empty() {
+        if imported_from.is_empty() && !imported_names.is_empty() {
+            imported_from = "external".to_string();
+        }
+        
+        if !imported_from.is_empty() || !imported_names.is_empty() {
             Some(Import {
                 id: 0,
                 file_path: String::new(),
@@ -616,27 +826,6 @@ impl Parser {
         node.utf8_text(content.as_bytes())
             .map(|s| s.to_string())
             .unwrap_or_default()
-    }
-
-    fn get_function_signature(node: &tree_sitter::Node, content: &str) -> String {
-        let mut parts = Vec::new();
-        
-        if let Some(params) = node.child_by_field_name("parameters") {
-            let text = Self::get_node_text(&params, content);
-            let params_str: Vec<&str> = text.split_whitespace().collect();
-            let params_clean: Vec<&str> = params_str.into_iter()
-                .filter(|s| !s.is_empty())
-                .collect();
-            if params_clean.len() > 1 {
-                parts.push(params_clean[params_clean.len()-1].to_string());
-            }
-        }
-        
-        if parts.is_empty() {
-            "()".to_string()
-        } else {
-            format!("({})", parts.join(", "))
-        }
     }
 
     fn get_rust_signature(node: &tree_sitter::Node, content: &str) -> String {
