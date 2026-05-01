@@ -261,11 +261,11 @@ impl Parser {
                     let node_ref = node;
                     search_tree(node_ref, content, &mut params_text, &mut return_type);
                     
-                    // Build signature
+                    // Build signature - params_text already includes parentheses from tree-sitter
                     let signature = if return_type.is_empty() {
-                        format!("{}({})", name, params_text)
+                        format!("{}{}", name, params_text)
                     } else {
-                        format!("{}({}): {}", name, params_text, return_type)
+                        format!("{}{}: {}", name, params_text, return_type)
                     };
                     
                     let line = node.start_position().row as i64 + 1;
