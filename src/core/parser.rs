@@ -398,30 +398,55 @@ if kind == "default_import" {
             return "()".to_string();
         }
         
-        let params_start = node_text.find('(');
-        let params_end = node_text.find(')');
-        
-        if params_start.is_none() || params_end.is_none() {
+        // Find first ( after the function name (skip any ( in the body)
+        let first_paren = node_text.find('(');
+        if first_paren.is_none() {
             return "()".to_string();
         }
         
-        let params_text = &node_text[params_start.unwrap()+1..params_end.unwrap()];
+        // Find the matching ) by tracking depth - start looking after the first (
+        let mut depth = 1;
+        let mut params_end = None;
         
-        let return_start = node_text.find("): ");
-        let return_type = if let Some(pos) = return_start {
-            let rt = node_text[pos+3..].trim();
-            if rt.is_empty() { "" } else { rt }
+        for (i, ch) in node_text[first_paren.unwrap() + 1..].chars().enumerate() {
+            if ch == '(' { depth += 1; }
+            else if ch == ')' { 
+                depth -= 1;
+                if depth == 0 {
+                    params_end = Some(first_paren.unwrap() + 1 + i);
+                    break;
+                }
+            }
+        }
+        
+        if params_end.is_none() {
+            return "()".to_string();
+        }
+        
+        let params_text = &node_text[first_paren.unwrap() + 1..params_end.unwrap()];
+        
+        // Find return type - look for "): " pattern
+        let return_pattern = node_text.find("): ");
+        let return_type = if let Some(pos) = return_pattern {
+            if pos < params_end.unwrap() {
+                // The ): is inside the params, ignore
+                String::new()
+            } else {
+                let rt = node_text[pos+3..].trim();
+                if rt.is_empty() { String::new() } else { rt.to_string() }
+            }
         } else {
-            ""
+            String::new()
         };
         
+        // Split params by comma, being careful with depth
         let mut param_list = Vec::new();
         let mut depth = 0;
         let mut current = String::new();
         
         for ch in params_text.chars() {
             if ch == '(' { depth += 1; current.push(ch); }
-            else if ch == ')' && depth > 0 { depth -= 1; current.push(ch); }
+            else if ch == ')' { depth -= 1; current.push(ch); }
             else if ch == ',' && depth == 0 {
                 param_list.push(current.trim().to_string());
                 current = String::new();
@@ -436,7 +461,6 @@ if kind == "default_import" {
         
         let formatted: Vec<String> = param_list.into_iter()
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
             .collect();
         
         if formatted.is_empty() {
