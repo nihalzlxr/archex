@@ -146,37 +146,43 @@ impl Db {
 
     pub fn get_context_for_file(&self, file_path: &str) -> Result<Option<FileContext>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.name, m.layer
-             FROM file_map f
-             JOIN modules m ON f.module_id = m.id
-             WHERE f.file_path = ?1"
+            "SELECT m.name, m.layer, r.rule_type, r.description, r.pattern
+             FROM file_map fm
+             JOIN modules m ON fm.module_id = m.id
+             LEFT JOIN rules r ON r.module_id = m.id
+             WHERE fm.file_path = ?1"
         )?;
 
-        let module: Option<(String, String)> = stmt
-            .query_row([file_path], |row| Ok((row.get(0)?, row.get(1)?)))
-            .ok();
+        let mut rows = stmt.query([file_path])?;
 
-        let Some((module_name, layer)) = module else {
-            return Ok(None);
+        let mut module_name: Option<String> = None;
+        let mut layer: Option<String> = None;
+        let mut rules: Vec<Rule> = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            if module_name.is_none() {
+                module_name = Some(row.get(0)?);
+                layer = Some(row.get(1)?);
+            }
+            
+            let rule_type: Option<String> = row.get(2).ok();
+            let description: Option<String> = row.get(3).ok();
+            let pattern: Option<String> = row.get(4).ok();
+
+            if let (Some(rt), Some(desc)) = (rule_type, description) {
+                rules.push(Rule {
+                    id: rules.len() as i64 + 1,
+                    rule_type: RuleType::from(rt),
+                    description: desc,
+                    pattern,
+                });
+            }
+        }
+
+        let (module_name, layer) = match (module_name, layer) {
+            (Some(name), Some(layer)) => (name, layer),
+            _ => return Ok(None),
         };
-
-        let mut stmt = self.conn.prepare(
-            "SELECT id, rule_type, description, pattern
-             FROM rules
-             WHERE module_id = (SELECT module_id FROM file_map WHERE file_path = ?1)"
-        )?;
-
-        let rules: Vec<Rule> = stmt
-            .query_map([file_path], |row| {
-                Ok(Rule {
-                    id: row.get(0)?,
-                    rule_type: RuleType::from(row.get::<_, String>(1)?),
-                    description: row.get(2)?,
-                    pattern: row.get(3)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
 
         Ok(Some(FileContext {
             module_name,
@@ -187,5 +193,17 @@ impl Db {
 
     pub fn get_rule_count(&self) -> Result<i64> {
         self.conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
+    }
+
+    pub fn get_module_id_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let result: Result<i64, _> = self.conn.query_row(
+            "SELECT id FROM modules WHERE name = ?1 LIMIT 1",
+            [name],
+            |row| row.get(0)
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(_) => Ok(None),
+        }
     }
 }

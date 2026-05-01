@@ -119,29 +119,43 @@ fn seed_nextjs_modules(db: &Db) -> usize {
         db.insert_module(name, layer, pattern).expect("Failed to insert module");
     }
 
-    // module 1: app (src/app/**)
-    db.insert_rule(1, "forbidden", "Direct database access in UI layer", Some("from.*@/db|from.*drizzle"))
-        .expect("Failed to insert rule");
-    db.insert_rule(1, "forbidden", "Direct API calls without hooks, use src/hooks", Some("fetch\\(|axios\\."))
-        .expect("Failed to insert rule");
+    // Get the correct module IDs by name
+    let app_id = db.get_module_id_by_name("app").expect("Failed to get app module id");
+    let components_id = db.get_module_id_by_name("components").expect("Failed to get components module id");
+    let api_id = db.get_module_id_by_name("api").expect("Failed to get api module id");
+    let services_id = db.get_module_id_by_name("services").expect("Failed to get services module id");
 
-    // module 2: components (src/components/**)
-    db.insert_rule(2, "forbidden", "No direct server calls from components", Some("from.*@/server"))
-        .expect("Failed to insert rule");
-    db.insert_rule(2, "warning", "Avoid business logic in components", Some("function |const .* ="))
-        .expect("Failed to insert rule");
+    // app rules
+    if let Some(id) = app_id {
+        db.insert_rule(id, "forbidden", "Direct database access in UI layer", Some("from.*@/db|from.*drizzle"))
+            .expect("Failed to insert rule");
+        db.insert_rule(id, "forbidden", "Direct API calls without hooks, use src/hooks", Some("fetch\\(|axios\\."))
+            .expect("Failed to insert rule");
+    }
 
-    // module 3: api (src/app/api/**)
-    db.insert_rule(3, "forbidden", "Direct database import in API route", Some("from.*@/db|from.*drizzle"))
-        .expect("Failed to insert rule");
-    db.insert_rule(3, "forbidden", "Business logic in API route, use services layer", Some("from.*@/services"))
-        .expect("Failed to insert rule");
-    db.insert_rule(3, "required", "API routes must validate input", Some("zod|yup|joi"))
-        .expect("Failed to insert rule");
+    // components rules
+    if let Some(id) = components_id {
+        db.insert_rule(id, "forbidden", "No direct server calls from components", Some("from.*@/server"))
+            .expect("Failed to insert rule");
+        db.insert_rule(id, "warning", "Avoid business logic in components", Some("function |const .* ="))
+            .expect("Failed to insert rule");
+    }
 
-    // module 7: services (src/services/**)
-    db.insert_rule(7, "required", "Services must use db layer, not direct SQL", Some("from.*@/db|from.*drizzle"))
-        .expect("Failed to insert rule");
+    // api rules
+    if let Some(id) = api_id {
+        db.insert_rule(id, "forbidden", "Direct database import in API route", Some("from.*@/db|from.*drizzle"))
+            .expect("Failed to insert rule");
+        db.insert_rule(id, "forbidden", "Business logic in API route, use services layer", Some("from.*@/services"))
+            .expect("Failed to insert rule");
+        db.insert_rule(id, "required", "API routes must validate input", Some("zod|yup|joi"))
+            .expect("Failed to insert rule");
+    }
+
+    // services rules
+    if let Some(id) = services_id {
+        db.insert_rule(id, "required", "Services must use db layer, not direct SQL", Some("from.*@/db|from.*drizzle"))
+            .expect("Failed to insert rule");
+    }
 
     let rule_count = db.get_rule_count().expect("Failed to get rule count");
     eprintln!("Seeded {} modules with {} rules.", modules.len(), rule_count);

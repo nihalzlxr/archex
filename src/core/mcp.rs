@@ -20,7 +20,18 @@ impl ArchexService {
         #[tool(aggr)] req: GetContextRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
         let db_path = Path::new(".archex/db.sqlite");
-        let db = Db::open(db_path).map_err(|e| rmcp::Error::internal_error(e.to_string(), None))?;
+        
+        let db = match Db::open(db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "found": false,
+                        "message": format!("Database not found. Run 'archex init' first. Error: {}", e)
+                    })).unwrap()
+                )]));
+            }
+        };
         
         match db.get_context_for_file(&req.file_path) {
             Ok(Some(ctx)) => Ok(CallToolResult::success(vec![Content::text(
@@ -35,10 +46,15 @@ impl ArchexService {
             Ok(None) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&serde_json::json!({
                     "found": false,
-                    "message": "File not mapped. Run: archex init"
+                    "message": format!("File '{}' not mapped. Run 'archex init' to scan project.", req.file_path)
                 })).unwrap()
             )])),
-            Err(e) => Err(rmcp::Error::internal_error(e.to_string(), None))
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({
+                    "found": false,
+                    "message": format!("Error: {}", e)
+                })).unwrap()
+            )]))
         }
     }
 }
