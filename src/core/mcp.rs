@@ -139,7 +139,10 @@ impl ArchexService {
         #[tool(aggr)] req: CreatePlanRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
         let api_key = match std::env::var("OPENROUTER_API_KEY") {
-            Ok(key) if !key.is_empty() => key,
+            Ok(key) if !key.is_empty() => {
+                eprintln!("[archex] API key loaded: {}", &key[..8]);
+                key
+            }
             _ => {
                 return Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string(&serde_json::json!({
@@ -192,6 +195,8 @@ impl ArchexService {
             )
         }).collect::<Vec<_>>().join("\n\n");
 
+        eprintln!("[archex] Context built, length: {}", context.len());
+
         let system_prompt = format!(
             "You are Archex, a senior software architect. You know this codebase:\n\n{}\n\nGenerate implementation plans as JSON only. No markdown. No explanation. Only valid JSON.",
             context
@@ -203,6 +208,7 @@ impl ArchexService {
         );
 
         // Call OpenRouter API
+        eprintln!("[archex] Calling OpenRouter with model: openrouter/auto");
         let client = reqwest::Client::new();
         let response = client
             .post("https://openrouter.ai/api/v1/chat/completions")
@@ -211,7 +217,7 @@ impl ArchexService {
             .header("HTTP-Referer", "https://archex.dev")
             .header("X-Title", "Archex")
             .json(&serde_json::json!({
-                "model": "google/gemma-3-27b-it:free",
+                "model": "openrouter/auto",
                 "temperature": 0.3,
                 "response_format": { "type": "json_object" },
                 "messages": [
@@ -224,40 +230,19 @@ impl ArchexService {
 
         match response {
             Ok(resp) => {
-                let json: serde_json::Value = match resp.json().await {
-                    Ok(j) => j,
+                eprintln!("[archex] Response status: {}", resp.status());
+                let body = match resp.text().await {
+                    Ok(b) => b,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(
                             serde_json::to_string(&serde_json::json!({
-                                "error": format!("Failed to parse API response: {}", e)
+                                "error": format!("Failed to read response body: {}", e)
                             })).unwrap()
                         )]));
                     }
                 };
-
-                if let Some(content) = json.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(|t| t.as_str()) {
-                    // Try to parse as JSON
-                    match serde_json::from_str::<serde_json::Value>(content) {
-                        Ok(plan) => {
-                            return Ok(CallToolResult::success(vec![Content::text(
-                                serde_json::to_string(&plan).unwrap()
-                            )]));
-                        }
-                        Err(_) => {
-                            // Return with warning
-                            return Ok(CallToolResult::success(vec![Content::text(
-                                serde_json::to_string(&serde_json::json!({
-                                    "warning": "could not parse as JSON",
-                                    "raw": content
-                                })).unwrap()
-                            )]));
-                        }
-                    }
-                }
-
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&json).unwrap()
-                )]))
+                eprintln!("[archex] Response body: {}", body);
+                return Ok(CallToolResult::success(vec![Content::text(body)]));
             }
             Err(e) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&serde_json::json!({
