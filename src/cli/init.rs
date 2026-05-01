@@ -59,6 +59,8 @@ pub fn run() {
     eprintln!("Files scanned: {}", result.files_scanned);
     eprintln!("Files mapped: {}", result.files_mapped);
     eprintln!("Files unmapped: {}", result.files_unmapped.len());
+    eprintln!("Symbols extracted: {}", result.symbols_extracted);
+    eprintln!("Imports extracted: {}", result.imports_extracted);
 
     if !result.files_unmapped.is_empty() {
         eprintln!("Unmapped files:");
