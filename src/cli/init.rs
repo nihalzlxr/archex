@@ -1,11 +1,10 @@
-use crate::core::db::Db;
+use crate::core::db::{Db, DB_PATH};
 use crate::core::parser::Parser;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
 const ARCHEX_DIR: &str = ".archex";
-const DB_PATH: &str = ".archex/db.sqlite";
 
 pub fn run() {
     let project_root = std::env::current_dir().expect("Failed to get current directory");

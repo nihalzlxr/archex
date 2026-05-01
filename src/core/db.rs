@@ -2,6 +2,8 @@ use rusqlite::{Connection, Result};
 use std::path::Path;
 use serde::Serialize;
 
+pub const DB_PATH: &str = ".archex/archex.db";
+
 pub struct Db {
     conn: Connection,
 }

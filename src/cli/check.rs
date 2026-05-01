@@ -1,10 +1,8 @@
-use crate::core::db::Db;
+use crate::core::db::{Db, DB_PATH};
 use crate::core::parser::{Parser, DriftResult, DriftViolation};
 use regex::Regex;
 use std::path::Path;
 use crate::core::db::RuleType;
-
-const DB_PATH: &str = ".archex/db.sqlite";
 
 pub fn run(file_path: String) -> Result<(), Box<dyn std::error::Error>> {
     let db = Db::open(Path::new(DB_PATH))?;

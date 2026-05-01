@@ -1,8 +1,6 @@
-use crate::core::db::{Db, RuleType};
+use crate::core::db::{Db, RuleType, DB_PATH};
 use clap::{Parser, Subcommand};
 use std::path::Path;
-
-const DB_PATH: &str = ".archex/db.sqlite";
 
 #[derive(Parser)]
 pub struct RuleCli {

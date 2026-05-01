@@ -1,8 +1,6 @@
-use crate::core::db::Db;
+use crate::core::db::{Db, DB_PATH};
 use clap::{Parser, Subcommand};
 use std::path::Path;
-
-const DB_PATH: &str = ".archex/db.sqlite";
 
 #[derive(Parser)]
 pub struct DecisionCli {

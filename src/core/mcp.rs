@@ -1,6 +1,6 @@
 use rmcp::{ServerHandler, ServiceExt, model::*, schemars, tool, transport::stdio};
 use serde::Deserialize;
-use crate::core::db::{Db, SymbolType};
+use crate::core::db::{Db, SymbolType, DB_PATH};
 use crate::core::parser::{Parser, DriftViolation, DriftResult};
 use std::path::Path;
 use regex::Regex;
@@ -45,7 +45,7 @@ impl ArchexService {
         &self,
         #[tool(aggr)] req: GetContextRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let db_path = Path::new(".archex/db.sqlite");
+        let db_path = Path::new(DB_PATH);
         
         let db = match Db::open(db_path) {
             Ok(db) => db,
@@ -89,7 +89,7 @@ impl ArchexService {
         &self,
         #[tool(aggr)] req: GetModuleRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let db_path = Path::new(".archex/db.sqlite");
+        let db_path = Path::new(DB_PATH);
         
         let db = match Db::open(db_path) {
             Ok(db) => db,
@@ -152,7 +152,7 @@ impl ArchexService {
         &self,
         #[tool(aggr)] req: CreatePlanRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let db_path = Path::new(".archex/db.sqlite");
+        let db_path = Path::new(DB_PATH);
         let db = match Db::open(db_path) {
             Ok(db) => db,
             Err(e) => {
@@ -327,7 +327,7 @@ impl ArchexService {
         &self,
         #[tool(aggr)] req: FindSimilarRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let db_path = Path::new(".archex/db.sqlite");
+        let db_path = Path::new(DB_PATH);
         let db = match Db::open(db_path) {
             Ok(db) => db,
             Err(e) => {
@@ -393,7 +393,7 @@ impl ArchexService {
         &self,
         #[tool(aggr)] req: CheckDriftRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let db_path = Path::new(".archex/db.sqlite");
+        let db_path = Path::new(DB_PATH);
         let db = match Db::open(db_path) {
             Ok(db) => db,
             Err(e) => {
