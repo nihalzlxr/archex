@@ -261,11 +261,23 @@ impl Parser {
                     let node_ref = node;
                     search_tree(node_ref, content, &mut params_text, &mut return_type);
                     
-                    // Build signature - params_text already includes parentheses from tree-sitter
-                    let signature = if return_type.is_empty() {
-                        format!("{}{}", name, params_text)
+                    // Clean up params_text - remove outer parens if present
+                    let params_text = params_text.trim().to_string();
+                    let params_clean = if params_text.starts_with('(') && params_text.ends_with(')') {
+                        params_text[1..params_text.len()-1].to_string()
                     } else {
-                        format!("{}{}: {}", name, params_text, return_type)
+                        params_text.clone()
+                    };
+                    
+                    // Clean up return_type - remove leading ": " if present
+                    let return_type = return_type.trim().to_string();
+                    let return_type = return_type.trim_start_matches(": ").to_string();
+                    
+                    // Build signature with clean params
+                    let signature = if return_type.is_empty() {
+                        format!("{}({})", name, params_clean)
+                    } else {
+                        format!("{}({}): {}", name, params_clean, return_type)
                     };
                     
                     let line = node.start_position().row as i64 + 1;
