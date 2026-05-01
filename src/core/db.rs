@@ -41,6 +41,16 @@ pub struct Module {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub layer: String,
+    pub path_pattern: String,
+    pub file_count: i64,
+    pub files: Vec<String>,
+    pub rules: Vec<Rule>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct FileContext {
     pub module_name: String,
     pub layer: String,
@@ -197,7 +207,7 @@ impl Db {
 
     pub fn get_module_id_by_name(&self, name: &str) -> Result<Option<i64>> {
         let result: Result<i64, _> = self.conn.query_row(
-            "SELECT id FROM modules WHERE name = ?1 LIMIT 1",
+            "SELECT id FROM modules WHERE LOWER(name) = LOWER(?1) LIMIT 1",
             [name],
             |row| row.get(0)
         );
@@ -205,5 +215,65 @@ impl Db {
             Ok(id) => Ok(Some(id)),
             Err(_) => Ok(None),
         }
+    }
+
+    pub fn get_module_info(&self, name: &str) -> Result<Option<ModuleInfo>> {
+        let result: Result<(i64, String, String), _> = self.conn.query_row(
+            "SELECT id, layer, path_pattern FROM modules WHERE LOWER(name) = LOWER(?1) LIMIT 1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        );
+
+        let (module_id, layer, path_pattern) = match result {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        let file_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM file_map WHERE module_id = ?1",
+            [module_id],
+            |row| row.get(0)
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path FROM file_map WHERE module_id = ?1"
+        )?;
+        let files: Vec<String> = stmt
+            .query_map([module_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rule_type, description, pattern FROM rules WHERE module_id = ?1"
+        )?;
+        let rules: Vec<Rule> = stmt
+            .query_map([module_id], |row| {
+                Ok(Rule {
+                    id: row.get(0)?,
+                    rule_type: RuleType::from(row.get::<_, String>(1)?),
+                    description: row.get(2)?,
+                    pattern: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(Some(ModuleInfo {
+            name: name.to_string(),
+            layer,
+            path_pattern,
+            file_count,
+            files,
+            rules,
+        }))
+    }
+
+    pub fn get_all_module_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT name FROM modules ORDER BY name")?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(names)
     }
 }

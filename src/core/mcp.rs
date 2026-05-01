@@ -9,6 +9,12 @@ pub struct GetContextRequest {
     pub file_path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetModuleRequest {
+    #[schemars(description = "Module name e.g. api, services, jobs")]
+    pub module_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArchexService;
 
@@ -49,6 +55,69 @@ impl ArchexService {
                     "message": format!("File '{}' not mapped. Run 'archex init' to scan project.", req.file_path)
                 })).unwrap()
             )])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({
+                    "found": false,
+                    "message": format!("Error: {}", e)
+                })).unwrap()
+            )]))
+        }
+    }
+
+    #[tool(description = "Get module info: layer, files, and rules")]
+    async fn get_module(
+        &self,
+        #[tool(aggr)] req: GetModuleRequest,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let db_path = Path::new(".archex/db.sqlite");
+        
+        let db = match Db::open(db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "found": false,
+                        "message": format!("Database not found. Run 'archex init' first. Error: {}", e)
+                    })).unwrap()
+                )]));
+            }
+        };
+        
+        match db.get_module_info(&req.module_name) {
+            Ok(Some(info)) => {
+                let rules: Vec<serde_json::Value> = info.rules.iter().map(|r| {
+                    serde_json::json!({
+                        "type": match r.rule_type {
+                            crate::core::db::RuleType::Forbidden => "forbidden",
+                            crate::core::db::RuleType::Required => "required",
+                            crate::core::db::RuleType::Warning => "warning",
+                        },
+                        "description": r.description,
+                        "pattern": r.pattern
+                    })
+                }).collect();
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "found": true,
+                        "module": info.name,
+                        "layer": info.layer,
+                        "path_pattern": info.path_pattern,
+                        "file_count": info.file_count,
+                        "files": info.files,
+                        "rules": rules
+                    })).unwrap()
+                )]))
+            }
+            Ok(None) => {
+                let all_names = db.get_all_module_names().unwrap_or_default();
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "found": false,
+                        "message": format!("Module '{}' not found. Available: {}", req.module_name, all_names.join(", "))
+                    })).unwrap()
+                )]))
+            }
             Err(e) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&serde_json::json!({
                     "found": false,
