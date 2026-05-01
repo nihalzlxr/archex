@@ -23,6 +23,8 @@ enum Commands {
         #[arg(long)]
         file_path: String,
     },
+    Rule,
+    Decision,
 }
 
 #[tokio::main]
@@ -45,6 +47,18 @@ async fn main() {
         }
         Commands::Check { file_path } => {
             if let Err(e) = cli::check::run(file_path) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Rule => {
+            if let Err(e) = cli::rule::run() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Decision => {
+            if let Err(e) = cli::decision::run() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

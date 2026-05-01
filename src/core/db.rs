@@ -310,6 +310,70 @@ impl Db {
         self.conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
     }
 
+    pub fn delete_rule(&self, rule_id: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM rules WHERE id = ?1", [rule_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_decision(&self, title: &str, context: Option<&str>, decision: &str) -> Result<i64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        self.conn.execute(
+            "INSERT INTO decisions (title, context, decision, created_at) VALUES (?1, ?2, ?3, ?4)",
+            (title, context, decision, now),
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_decisions(&self, limit: usize) -> Result<Vec<(i64, String, Option<String>, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, context, decision, created_at FROM decisions ORDER BY created_at DESC LIMIT ?1"
+        )?;
+        
+        let rows = stmt.query_map([limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        
+        Ok(rows)
+    }
+
+    pub fn search_decisions_db(&self, query: &str) -> Result<Vec<(i64, String, Option<String>, String, i64)>> {
+        let pattern = format!("%{}%", query.to_lowercase());
+        
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, context, decision, created_at FROM decisions 
+             WHERE LOWER(title) LIKE ?1 OR LOWER(context) LIKE ?1 OR LOWER(decision) LIKE ?1
+             ORDER BY created_at DESC LIMIT 20"
+        )?;
+        
+        let rows = stmt.query_map([&pattern], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        
+        Ok(rows)
+    }
+
     pub fn search_files(&self, keyword: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT file_path FROM file_map WHERE file_path LIKE ?1")?;
         let pattern = format!("%{}%", keyword);
