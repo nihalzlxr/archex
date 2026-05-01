@@ -276,4 +276,77 @@ impl Db {
             .collect();
         Ok(names)
     }
+
+    pub fn find_relevant_modules(&self, keywords: &[String]) -> Result<Vec<ModuleContext>> {
+        let mut results: Vec<(i64, String, String, String, Vec<String>)> = Vec::new();
+
+        // Get all modules
+        let mut stmt = self.conn.prepare("SELECT id, name, layer, path_pattern FROM modules")?;
+        let modules: Vec<(i64, String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (id, name, layer, pattern) in modules {
+            let mut score = 0;
+            let name_lower = name.to_lowercase();
+            
+            for kw in keywords {
+                let kw_lower = kw.to_lowercase();
+                if name_lower.contains(&kw_lower) {
+                    score += 3;
+                }
+            }
+
+            if score > 0 {
+                // Get sample files (up to 5)
+                let mut file_stmt = self.conn.prepare(
+                    "SELECT file_path FROM file_map WHERE module_id = ?1 LIMIT 5"
+                )?;
+                let files: Vec<String> = file_stmt
+                    .query_map([id], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                // Get rules
+                let mut rule_stmt = self.conn.prepare(
+                    "SELECT rule_type, description, pattern FROM rules WHERE module_id = ?1"
+                )?;
+                let rules: Vec<String> = rule_stmt
+                    .query_map([id], |row| {
+                        let rt: String = row.get(0)?;
+                        let desc: String = row.get(1)?;
+                        Ok(format!("[{}] {}", rt, desc))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                results.push((score, name, layer, pattern, rules));
+            }
+        }
+
+        // Sort by score descending and take top 4
+        results.sort_by(|a, b| b.0.cmp(&a.0));
+        results.truncate(4);
+
+        let context: Vec<ModuleContext> = results
+            .into_iter()
+            .map(|(_, name, layer, pattern, rules)| ModuleContext {
+                name,
+                layer,
+                path_pattern: pattern,
+                rules,
+            })
+            .collect();
+
+        Ok(context)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModuleContext {
+    pub name: String,
+    pub layer: String,
+    pub path_pattern: String,
+    pub rules: Vec<String>,
 }

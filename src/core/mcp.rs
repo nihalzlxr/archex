@@ -15,6 +15,12 @@ pub struct GetModuleRequest {
     pub module_name: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreatePlanRequest {
+    #[schemars(description = "Feature description in plain English")]
+    pub feature: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArchexService;
 
@@ -122,6 +128,129 @@ impl ArchexService {
                 serde_json::to_string(&serde_json::json!({
                     "found": false,
                     "message": format!("Error: {}", e)
+                })).unwrap()
+            )]))
+        }
+    }
+
+    #[tool(description = "Generate implementation plan for a feature using AI")]
+    async fn create_plan(
+        &self,
+        #[tool(aggr)] req: CreatePlanRequest,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(key) if !key.is_empty() => key,
+            _ => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": "ANTHROPIC_API_KEY environment variable not set"
+                    })).unwrap()
+                )]));
+            }
+        };
+
+        let db_path = Path::new(".archex/db.sqlite");
+        let db = match Db::open(db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": format!("Database not found. Run 'archex init' first. Error: {}", e)
+                    })).unwrap()
+                )]));
+            }
+        };
+
+        // Extract keywords from feature
+        let stop_words = ["a", "an", "the", "to", "for", "in", "of", "with", "and", "or", "is", "are", "be", "have", "has", "that", "this", "it"];
+        let keywords: Vec<String> = req.feature
+            .split_whitespace()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty() && !stop_words.iter().any(|w| w == s))
+            .collect();
+
+        // Find relevant modules
+        let modules = match db.find_relevant_modules(&keywords) {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": format!("Failed to find modules: {}", e)
+                    })).unwrap()
+                )]));
+            }
+        };
+
+        // Build context string
+        let context = modules.iter().map(|m| {
+            format!(
+                "Module: {} (layer: {}, pattern: {})\n  Rules: {}\n",
+                m.name,
+                m.layer,
+                m.path_pattern,
+                m.rules.join("; ")
+            )
+        }).collect::<Vec<_>>().join("\n");
+
+        let system_prompt = format!(
+            "You are Archex, a senior software architect. You know this codebase structure:\n\n{}\n\nYou must generate a precise implementation plan for the requested feature. Always output valid JSON only, no markdown, no explanation.",
+            context
+        );
+
+        let user_prompt = format!(
+            "Feature request: {}\n\nGenerate a plan with this exact JSON structure:\n{{\n  \"feature\": \"...\",\n  \"summary\": \"one line description\",\n  \"modules_involved\": [\"api\", \"services\", \"jobs\"],\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"action\": \"CREATE|MODIFY|DELETE\",\n      \"file_path\": \"src/services/fee-reminder.ts\",\n      \"description\": \"what to implement in this file\",\n      \"pattern_to_follow\": \"src/services/fee.ts\",\n      \"rules\": [\"no direct DB access\", \"validate inputs with zod\"]\n    }}\n  ],\n  \"security_checklist\": [\n    \"Validate all inputs with zod\",\n    \"Check authentication before data access\",\n    \"No secrets hardcoded\"\n  ],\n  \"estimated_files\": 4\n}}",
+            req.feature
+        );
+
+        // Call Anthropic API
+        let client = reqwest::Client::new();
+        let response = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 4000,
+                "system": system_prompt,
+                "messages": [
+                    {"role": "user", "content": user_prompt}
+                ]
+            }))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let json: serde_json::Value = match resp.json().await {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            serde_json::to_string(&serde_json::json!({
+                                "error": format!("Failed to parse API response: {}", e)
+                            })).unwrap()
+                        )]));
+                    }
+                };
+
+                if let Some(content) = json.get("content").and_then(|c| c.as_array()).and_then(|a| a.first()) {
+                    if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
+                        // Try to extract valid JSON from the response
+                        if let Ok(plan) = serde_json::from_str::<serde_json::Value>(text) {
+                            return Ok(CallToolResult::success(vec![Content::text(
+                                serde_json::to_string(&plan).unwrap()
+                            )]));
+                        }
+                    }
+                }
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&json).unwrap()
+                )]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({
+                    "error": format!("API call failed: {}", e)
                 })).unwrap()
             )]))
         }
