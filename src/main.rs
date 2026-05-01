@@ -19,6 +19,10 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
     },
+    Check {
+        #[arg(long)]
+        file_path: String,
+    },
 }
 
 #[tokio::main]
@@ -35,6 +39,12 @@ async fn main() {
         }
         Commands::Setup { agent } => {
             if let Err(e) = cli::setup::run(agent) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Check { file_path } => {
+            if let Err(e) = cli::check::run(file_path) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

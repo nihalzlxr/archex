@@ -1,7 +1,9 @@
 use rmcp::{ServerHandler, ServiceExt, model::*, schemars, tool, transport::stdio};
 use serde::Deserialize;
 use crate::core::db::{Db, SymbolType};
+use crate::core::parser::{Parser, DriftViolation, DriftResult};
 use std::path::Path;
+use regex::Regex;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetContextRequest {
@@ -25,6 +27,12 @@ pub struct CreatePlanRequest {
 pub struct FindSimilarRequest {
     #[schemars(description = "Description of what you're looking for (e.g. 'auth function', 'user model')")]
     pub description: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckDriftRequest {
+    #[schemars(description = "Relative file path to check for drift")]
+    pub file_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -377,6 +385,150 @@ impl ArchexService {
                 "matches": results,
                 "search_terms": keywords
             })).unwrap()
+        )]))
+    }
+
+    #[tool(description = "Check a file for architecture drift - pattern violations against module rules")]
+    async fn check_drift(
+        &self,
+        #[tool(aggr)] req: CheckDriftRequest,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let db_path = Path::new(".archex/db.sqlite");
+        let db = match Db::open(db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": format!("Database not found. Run 'archex init' first. Error: {}", e)
+                    })).unwrap()
+                )]));
+            }
+        };
+
+        let project_root = Path::new(".");
+        
+        let full_path = if req.file_path.starts_with('/') || req.file_path.contains(':') {
+            Path::new(&req.file_path).to_path_buf()
+        } else {
+            project_root.join(&req.file_path)
+        };
+
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": format!("Could not read file: {}", e)
+                    })).unwrap()
+                )]));
+            }
+        };
+
+        let module_info = db.get_module_for_file(&req.file_path).ok().and_then(|m| m);
+        let module_name = module_info.as_ref().map(|(n, _)| n.clone()).unwrap_or_default();
+
+        let rules = if let Some((_, module_id)) = module_info {
+            db.get_rules_for_module(module_id).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let mut drift_result = crate::core::parser::Parser::check_drift(&req.file_path, &content);
+        drift_result.module = module_name.clone();
+
+        for rule in &rules {
+            let rule_type_str = match rule.rule_type {
+                crate::core::db::RuleType::Forbidden => "forbidden",
+                crate::core::db::RuleType::Required => "required",
+                crate::core::db::RuleType::Warning => "warning",
+            };
+
+            if let Some(pattern) = &rule.pattern {
+                let pattern_lower = pattern.to_lowercase();
+                let content_lower = content.to_lowercase();
+
+                match rule.rule_type {
+                    crate::core::db::RuleType::Forbidden => {
+                        let regex_result = Regex::new(pattern);
+                        let matches = if let Ok(re) = regex_result {
+                            re.is_match(&content_lower)
+                        } else {
+                            content_lower.contains(&pattern_lower)
+                        };
+
+                        if matches {
+                            drift_result.violations.push(
+                                crate::core::parser::DriftViolation {
+                                    rule_type: rule_type_str.to_string(),
+                                    rule_description: rule.description.clone(),
+                                    pattern: Some(pattern.clone()),
+                                    line_number: None,
+                                    suggestion: format!("Remove or refactor matching pattern"),
+                                }
+                            );
+                        }
+                    }
+                    crate::core::db::RuleType::Required => {
+                        let regex_result = Regex::new(pattern);
+                        let has_pattern = if let Ok(re) = regex_result {
+                            re.is_match(&content_lower)
+                        } else {
+                            content_lower.contains(&pattern_lower)
+                        };
+
+                        if !has_pattern {
+                            drift_result.violations.push(
+                                crate::core::parser::DriftViolation {
+                                    rule_type: rule_type_str.to_string(),
+                                    rule_description: rule.description.clone(),
+                                    pattern: Some(pattern.clone()),
+                                    line_number: None,
+                                    suggestion: format!("Add required pattern: {}", pattern),
+                                }
+                            );
+                        }
+                    }
+                    crate::core::db::RuleType::Warning => {
+                        let regex_result = Regex::new(pattern);
+                        let matches = if let Ok(re) = regex_result {
+                            re.is_match(&content_lower)
+                        } else {
+                            content_lower.contains(&pattern_lower)
+                        };
+
+                        if matches {
+                            drift_result.violations.push(
+                                crate::core::parser::DriftViolation {
+                                    rule_type: rule_type_str.to_string(),
+                                    rule_description: rule.description.clone(),
+                                    pattern: Some(pattern.clone()),
+                                    line_number: None,
+                                    suggestion: "Consider refactoring".to_string(),
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let result_json = serde_json::json!({
+            "file_path": drift_result.file_path,
+            "module": drift_result.module,
+            "violations": drift_result.violations.iter().map(|v| {
+                serde_json::json!({
+                    "rule_type": v.rule_type,
+                    "rule_description": v.rule_description,
+                    "pattern": v.pattern,
+                    "line_number": v.line_number,
+                    "suggestion": v.suggestion
+                })
+            }).collect::<Vec<_>>(),
+            "clean": drift_result.clean
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result_json).unwrap()
         )]))
     }
 }

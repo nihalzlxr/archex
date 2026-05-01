@@ -95,6 +95,7 @@ dependencies = [
  "anyhow",
  "clap",
  "glob",
+ "regex",
  "reqwest",
  "rmcp",
  "rusqlite",

@@ -261,6 +261,51 @@ impl Db {
         }))
     }
 
+    pub fn get_module_for_file(&self, file_path: &str) -> Result<Option<(String, i64)>> {
+        let result: Result<(String, i64), _> = self.conn.query_row(
+            "SELECT m.name, fm.module_id FROM file_map fm JOIN modules m ON fm.module_id = m.id WHERE fm.file_path = ?1",
+            [file_path],
+            |row| Ok((row.get(0)?, row.get(1)?))
+        );
+        
+        match result {
+            Ok((name, id)) => Ok(Some((name, id))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn get_rules_for_module(&self, module_id: i64) -> Result<Vec<Rule>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rule_type, description, pattern FROM rules WHERE module_id = ?1"
+        )?;
+        
+        let rules = stmt.query_map([module_id], |row| {
+            Ok(Rule {
+                id: row.get(0)?,
+                rule_type: RuleType::from(row.get::<_, String>(1)?),
+                description: row.get(2)?,
+                pattern: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        
+        Ok(rules)
+    }
+
+    pub fn get_module_path(&self, module_name: &str) -> Result<Option<String>> {
+        let result: Result<String, _> = self.conn.query_row(
+            "SELECT path_pattern FROM modules WHERE name = ?1",
+            [module_name],
+            |row| row.get(0)
+        );
+        
+        match result {
+            Ok(pattern) => Ok(Some(pattern)),
+            Err(_) => Ok(None),
+        }
+    }
+
     pub fn get_rule_count(&self) -> Result<i64> {
         self.conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
     }

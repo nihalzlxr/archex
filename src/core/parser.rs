@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use walkdir::WalkDir;
 use serde::Serialize;
+use regex::Regex;
 
 pub struct Parser {
     db: Db,
@@ -16,6 +17,23 @@ pub struct ScanResult {
     pub files_unmapped: Vec<PathBuf>,
     pub symbols_extracted: usize,
     pub imports_extracted: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftViolation {
+    pub rule_type: String,
+    pub rule_description: String,
+    pub pattern: Option<String>,
+    pub line_number: Option<i64>,
+    pub suggestion: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DriftResult {
+    pub file_path: String,
+    pub module: String,
+    pub violations: Vec<DriftViolation>,
+    pub clean: bool,
 }
 
 const SKIP_DIRS: &[&str] = &["node_modules", ".next", ".git", "dist", "build", "target"];
@@ -688,6 +706,133 @@ impl Parser {
             kind == "future_import_statement"
         } else {
             false
+        }
+    }
+
+    pub fn check_drift(file_path: &str, content: &str) -> DriftResult {
+        let mut violations = Vec::new();
+        
+        let ext = Path::new(file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        
+        let path_lower = file_path.to_lowercase();
+        let mut all_imports = Vec::new();
+        let mut all_symbols = Vec::new();
+        
+        match ext {
+            "ts" | "tsx" | "js" | "jsx" => {
+                let (syms, imps) = Self::extract_ts_symbols(file_path, 0, content, Path::new(file_path));
+                all_symbols = syms.into_iter().map(|s| (s.name, s.signature.unwrap_or_default())).collect();
+                all_imports = imps.into_iter().map(|i| i.imported_from).collect();
+            }
+            "rs" => {
+                let (syms, imps) = Self::extract_rust_symbols(file_path, 0, content);
+                all_symbols = syms.into_iter().map(|s| (s.name, s.signature.unwrap_or_default())).collect();
+                all_imports = imps.into_iter().map(|i| i.imported_from).collect();
+            }
+            "py" => {
+                let (syms, imps) = Self::extract_python_symbols(file_path, 0, content);
+                all_symbols = syms.into_iter().map(|s| (s.name, s.signature.unwrap_or_default())).collect();
+                all_imports = imps.into_iter().map(|i| i.imported_from).collect();
+            }
+            _ => {}
+        }
+        
+        let is_route_file = path_lower.contains("/app/api/") || path_lower.contains("/pages/api/");
+        
+        if is_route_file {
+            violations.push(DriftViolation {
+                rule_type: "route".to_string(),
+                rule_description: "API route detected".to_string(),
+                pattern: None,
+                line_number: None,
+                suggestion: "Ensure this route follows API conventions".to_string(),
+            });
+        }
+        
+        for import_from in &all_imports {
+            let import_lower = import_from.to_lowercase();
+            if import_lower.contains("@/db") || import_lower.contains("drizzle") || import_lower.contains("prisma") {
+                violations.push(DriftViolation {
+                    rule_type: "forbidden".to_string(),
+                    rule_description: "Direct database access in API layer".to_string(),
+                    pattern: Some(import_from.clone()),
+                    line_number: None,
+                    suggestion: "Use services layer for database access".to_string(),
+                });
+            }
+        }
+        
+        for (name, sig) in &all_symbols {
+            let combined = format!("{} {}", name, sig);
+            
+            if combined.contains("fetch(") || combined.contains("axios.") {
+                violations.push(DriftViolation {
+                    rule_type: "forbidden".to_string(),
+                    rule_description: "Direct API calls in non-service layer".to_string(),
+                    pattern: Some(combined.clone()),
+                    line_number: None,
+                    suggestion: "Use hooks or services for API calls".to_string(),
+                });
+            }
+            
+            if combined.contains("from.*@/server") || combined.contains("from '@/server") {
+                violations.push(DriftViolation {
+                    rule_type: "forbidden".to_string(),
+                    rule_description: "Server calls from components".to_string(),
+                    pattern: Some(combined.clone()),
+                    line_number: None,
+                    suggestion: "Move business logic to services layer".to_string(),
+                });
+            }
+        }
+        
+        let has_db_import = all_imports.iter().any(|i| i.contains("@/db") || i.contains("drizzle") || i.contains("prisma"));
+        let has_zod = all_symbols.iter().any(|(n, _)| n.contains("zod") || content.contains("z.object") || content.contains("zod."));
+        let has_validation = has_zod || content.contains("yup") || content.contains("joi");
+        
+        if path_lower.contains("/api/") && !has_validation && path_lower.ends_with(".ts") {
+            violations.push(DriftViolation {
+                rule_type: "required".to_string(),
+                rule_description: "API routes must validate input".to_string(),
+                pattern: Some("zod|yup|joi".to_string()),
+                line_number: None,
+                suggestion: "Add input validation with zod".to_string(),
+            });
+        }
+        
+        if path_lower.contains("/services/") && !has_db_import && path_lower.ends_with(".ts") {
+            violations.push(DriftViolation {
+                rule_type: "required".to_string(),
+                rule_description: "Services must use db layer".to_string(),
+                pattern: Some("from.*@/db".to_string()),
+                line_number: None,
+                suggestion: "Import db layer for data access".to_string(),
+            });
+        }
+        
+        let is_ui_layer = path_lower.contains("/components/") || path_lower.contains("/app/") || path_lower.contains("/pages/");
+        let has_direct_sql = content.to_lowercase().contains("execute(") || content.to_lowercase().contains("query(");
+        
+        if is_ui_layer && has_direct_sql {
+            violations.push(DriftViolation {
+                rule_type: "forbidden".to_string(),
+                rule_description: "Direct database access in UI layer".to_string(),
+                pattern: Some("execute|query".to_string()),
+                line_number: None,
+                suggestion: "Use services layer for database queries".to_string(),
+            });
+        }
+        
+        let clean = violations.iter().all(|v| v.rule_type != "forbidden");
+        
+        DriftResult {
+            file_path: file_path.to_string(),
+            module: String::new(),
+            violations,
+            clean,
         }
     }
 }
