@@ -15,6 +15,10 @@ struct Cli {
 enum Commands {
     Init,
     Serve,
+    Setup {
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -25,6 +29,12 @@ async fn main() {
         Commands::Init => cli::init::run(),
         Commands::Serve => {
             if let Err(e) = cli::serve::run().await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Setup { agent } => {
+            if let Err(e) = cli::setup::run(agent) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
