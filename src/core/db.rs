@@ -205,6 +205,19 @@ impl Db {
         self.conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
     }
 
+    pub fn search_files(&self, keyword: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT file_path FROM file_map WHERE file_path LIKE ?1")?;
+        let pattern = format!("%{}%", keyword);
+        let rows = stmt.query_map([pattern], |row| row.get(0))?;
+        let mut files = Vec::new();
+        for row in rows {
+            if let Ok(f) = row {
+                files.push(f);
+            }
+        }
+        Ok(files)
+    }
+
     pub fn get_module_id_by_name(&self, name: &str) -> Result<Option<i64>> {
         let result: Result<i64, _> = self.conn.query_row(
             "SELECT id FROM modules WHERE LOWER(name) = LOWER(?1) LIMIT 1",

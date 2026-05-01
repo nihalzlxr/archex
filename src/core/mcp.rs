@@ -138,20 +138,6 @@ impl ArchexService {
         &self,
         #[tool(aggr)] req: CreatePlanRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let api_key = match std::env::var("OPENROUTER_API_KEY") {
-            Ok(key) if !key.is_empty() => {
-                eprintln!("[archex] API key loaded: {}", &key[..8]);
-                key
-            }
-            _ => {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&serde_json::json!({
-                        "error": "OPENROUTER_API_KEY environment variable not set"
-                    })).unwrap()
-                )]));
-            }
-        };
-
         let db_path = Path::new(".archex/db.sqlite");
         let db = match Db::open(db_path) {
             Ok(db) => db,
@@ -164,7 +150,6 @@ impl ArchexService {
             }
         };
 
-        // Extract keywords from feature
         let stop_words = ["a","an","the","to","for","in","of","with","and","or","is","it","that","this","on","at","by","from","be","as","are","was","were","will","have","has","had","do","does","did","but","not","we","i","you","they","he","she","its"];
         let keywords: Vec<String> = req.feature
             .split_whitespace()
@@ -172,7 +157,6 @@ impl ArchexService {
             .filter(|s| !s.is_empty() && !stop_words.iter().any(|w| w == s))
             .collect();
 
-        // Find relevant modules
         let modules = match db.find_relevant_modules(&keywords) {
             Ok(m) => m,
             Err(e) => {
@@ -184,72 +168,61 @@ impl ArchexService {
             }
         };
 
-        // Build context string
-        let context = modules.iter().map(|m| {
-            format!(
-                "Module: {} | Layer: {} | Pattern: {}\n  Rules: {}",
-                m.name,
-                m.layer,
-                m.path_pattern,
-                m.rules.join("; ")
-            )
-        }).collect::<Vec<_>>().join("\n\n");
+        let mut relevant_modules = Vec::new();
+        let mut similar_files: Vec<String> = Vec::new();
 
-        eprintln!("[archex] Context built, length: {}", context.len());
+        for m in &modules {
+            if let Ok(Some(info)) = db.get_module_info(&m.name) {
+                let example_files: Vec<String> = info.files.iter().take(8).cloned().collect();
+                similar_files.extend(example_files.clone());
 
-        let system_prompt = format!(
-            "You are Archex, a senior software architect. You know this codebase:\n\n{}\n\nGenerate implementation plans as JSON only. No markdown. No explanation. Only valid JSON.",
-            context
-        );
+                let rule_descriptions: Vec<String> = info.rules.iter().map(|r| r.description.clone()).collect();
 
-        let user_prompt = format!(
-            "Feature: {}\n\nRespond with this exact JSON structure:\n{{\n  \"feature\": \"...\",\n  \"summary\": \"one line description\",\n  \"modules_involved\": [\"module1\", \"module2\"],\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"action\": \"CREATE or MODIFY\",\n      \"file_path\": \"exact/path/from/codebase.ts\",\n      \"description\": \"what to implement\",\n      \"pattern_to_follow\": \"existing/similar/file.ts or null\",\n      \"rules\": [\"rule1\", \"rule2\"]\n    }}\n  ],\n  \"security_checklist\": [\n    \"Validate inputs with zod\",\n    \"Check auth before data access\"\n  ],\n  \"estimated_files\": 3\n}}",
-            req.feature
-        );
-
-        // Call OpenRouter API
-        eprintln!("[archex] Calling OpenRouter with model: openrouter/auto");
-        let client = reqwest::Client::new();
-        let response = client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://archex.dev")
-            .header("X-Title", "Archex")
-            .json(&serde_json::json!({
-                "model": "openrouter/auto",
-                "temperature": 0.3,
-                "response_format": { "type": "json_object" },
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-            }))
-            .send()
-            .await;
-
-        match response {
-            Ok(resp) => {
-                eprintln!("[archex] Response status: {}", resp.status());
-                let body = match resp.text().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string(&serde_json::json!({
-                                "error": format!("Failed to read response body: {}", e)
-                            })).unwrap()
-                        )]));
-                    }
-                };
-                eprintln!("[archex] Response body: {}", body);
-                return Ok(CallToolResult::success(vec![Content::text(body)]));
+                relevant_modules.push(serde_json::json!({
+                    "name": info.name,
+                    "layer": info.layer,
+                    "path_pattern": info.path_pattern,
+                    "example_files": example_files,
+                    "rules": rule_descriptions
+                }));
             }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&serde_json::json!({
-                    "error": format!("API call failed: {}", e)
-                })).unwrap()
-            )]))
         }
+
+        for keyword in &keywords {
+            if let Ok(files) = db.search_files(keyword) {
+                for f in files.iter().take(5) {
+                    if !similar_files.contains(f) {
+                        similar_files.push(f.clone());
+                    }
+                }
+            }
+        }
+
+        let result = serde_json::json!({
+            "feature": req.feature,
+            "context_for_agent": {
+                "relevant_modules": relevant_modules,
+                "similar_existing_files": similar_files.iter().take(10).cloned().collect::<Vec<_>>(),
+                "suggested_new_files": [],
+                "rules_to_enforce": [
+                    "Follow existing patterns in similar_existing_files",
+                    "No direct DB queries - use services layer",
+                    "Validate all inputs with zod",
+                    "Check auth before data access"
+                ],
+                "security_checklist": [
+                    "Input validation with zod",
+                    "Auth check before data access",
+                    "No hardcoded secrets",
+                    "Error boundaries set"
+                ]
+            },
+            "instruction": "You are a senior developer. Use the context above to generate a step-by-step implementation plan with exact file paths, following existing patterns."
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap()
+        )]))
     }
 }
 
