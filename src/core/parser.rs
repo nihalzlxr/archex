@@ -227,8 +227,35 @@ impl Parser {
             "function_declaration" | "method_definition" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = Self::get_node_text(&name_node, content);
-                    let full_text = node.utf8_text(content.as_bytes()).unwrap_or_default();
-                    let signature = Self::extract_ts_function_signature(&full_text);
+                    
+                    // Get parameters from formal_parameters node - use raw text directly
+                    let params_text: String = if let Some(params) = node.child_by_field_name("parameters") {
+                        params.utf8_text(content.as_bytes()).unwrap_or_default().to_string()
+                    } else {
+                        String::new()
+                    };
+                    
+                    // Get return type from type_annotation node
+                    let return_type: String = if let Some(ret) = node.child_by_field_name("return_type") {
+                        let rt = ret.utf8_text(content.as_bytes()).unwrap_or_default();
+                        if rt.starts_with(": ") {
+                            rt[2..].to_string()
+                        } else if rt.starts_with(':') {
+                            rt[1..].to_string()
+                        } else {
+                            rt.to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    
+                    // Build signature: "name(params)" or "name(params): returnType"
+                    let signature = if return_type.is_empty() {
+                        format!("{}({})", name, params_text)
+                    } else {
+                        format!("{}({}): {}", name, params_text, return_type)
+                    };
+                    
                     let line = node.start_position().row as i64 + 1;
                     
                     let symbol_type = if is_route_file { "route" } else { "function" };
