@@ -228,28 +228,40 @@ impl Parser {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = Self::get_node_text(&name_node, content);
                     
-                    // Get parameters from formal_parameters node - use raw text directly
-                    let params_text: String = if let Some(params) = node.child_by_field_name("parameters") {
-                        params.utf8_text(content.as_bytes()).unwrap_or_default().to_string()
-                    } else {
-                        String::new()
-                    };
+                    // Find parameters and return type by searching all children recursively
+                    let mut params_text: String = String::new();
+                    let mut return_type: String = String::new();
                     
-                    // Get return type from type_annotation node
-                    let return_type: String = if let Some(ret) = node.child_by_field_name("return_type") {
-                        let rt = ret.utf8_text(content.as_bytes()).unwrap_or_default();
-                        if rt.starts_with(": ") {
-                            rt[2..].to_string()
-                        } else if rt.starts_with(':') {
-                            rt[1..].to_string()
-                        } else {
-                            rt.to_string()
+                    fn search_tree(n: &tree_sitter::Node, content: &str, p: &mut String, r: &mut String) {
+                        let kn = n.kind();
+                        
+                        if kn == "formal_parameters" || kn == "required_parameters" || kn == "parameters" {
+                            if p.is_empty() {
+                                *p = n.utf8_text(content.as_bytes()).unwrap_or_default().to_string();
+                            }
                         }
-                    } else {
-                        String::new()
-                    };
+                        
+                        if kn == "type_annotation" {
+                            let text = n.utf8_text(content.as_bytes()).unwrap_or_default();
+                            if text.starts_with(": ") {
+                                *r = text[2..].to_string();
+                            } else if text.starts_with(':') && !text.contains(')') {
+                                *r = text[1..].to_string();
+                            }
+                        }
+                        
+                        for i in 0..n.child_count() {
+                            if let Some(ch) = n.child(i) {
+                                let ch_ref = &ch;
+                                search_tree(ch_ref, content, p, r);
+                            }
+                        }
+                    }
                     
-                    // Build signature: "name(params)" or "name(params): returnType"
+                    let node_ref = node;
+                    search_tree(node_ref, content, &mut params_text, &mut return_type);
+                    
+                    // Build signature
                     let signature = if return_type.is_empty() {
                         format!("{}({})", name, params_text)
                     } else {
