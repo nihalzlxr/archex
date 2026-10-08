@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use walkdir::WalkDir;
 use serde::Serialize;
-use regex::Regex;
 
 pub struct Parser {
     db: Db,

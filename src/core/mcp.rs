@@ -1,9 +1,7 @@
 use rmcp::{ServerHandler, ServiceExt, model::*, schemars, tool, transport::stdio};
 use serde::Deserialize;
 use crate::core::db::{Db, SymbolType, DB_PATH};
-use crate::core::parser::{Parser, DriftViolation, DriftResult};
 use std::path::Path;
-use regex::Regex;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetContextRequest {
@@ -444,70 +442,43 @@ impl ArchexService {
             };
 
             if let Some(pattern) = &rule.pattern {
-                let pattern_lower = pattern.to_lowercase();
-                let content_lower = content.to_lowercase();
+                let matches = crate::core::rule_engine::pattern_matches(&content, pattern);
 
                 match rule.rule_type {
-                    crate::core::db::RuleType::Forbidden => {
-                        let regex_result = Regex::new(pattern);
-                        let matches = if let Ok(re) = regex_result {
-                            re.is_match(&content_lower)
-                        } else {
-                            content_lower.contains(&pattern_lower)
-                        };
-
-                        if matches {
-                            drift_result.violations.push(
-                                crate::core::parser::DriftViolation {
-                                    rule_type: rule_type_str.to_string(),
-                                    rule_description: rule.description.clone(),
-                                    pattern: Some(pattern.clone()),
-                                    line_number: None,
-                                    suggestion: format!("Remove or refactor matching pattern"),
-                                }
-                            );
-                        }
+                    crate::core::db::RuleType::Forbidden if matches => {
+                        drift_result.violations.push(
+                            crate::core::parser::DriftViolation {
+                                rule_type: rule_type_str.to_string(),
+                                rule_description: rule.description.clone(),
+                                pattern: Some(pattern.clone()),
+                                line_number: None,
+                                suggestion: "Remove or refactor matching pattern".to_string(),
+                            }
+                        );
                     }
-                    crate::core::db::RuleType::Required => {
-                        let regex_result = Regex::new(pattern);
-                        let has_pattern = if let Ok(re) = regex_result {
-                            re.is_match(&content_lower)
-                        } else {
-                            content_lower.contains(&pattern_lower)
-                        };
-
-                        if !has_pattern {
-                            drift_result.violations.push(
-                                crate::core::parser::DriftViolation {
-                                    rule_type: rule_type_str.to_string(),
-                                    rule_description: rule.description.clone(),
-                                    pattern: Some(pattern.clone()),
-                                    line_number: None,
-                                    suggestion: format!("Add required pattern: {}", pattern),
-                                }
-                            );
-                        }
+                    crate::core::db::RuleType::Required if !matches => {
+                        drift_result.violations.push(
+                            crate::core::parser::DriftViolation {
+                                rule_type: rule_type_str.to_string(),
+                                rule_description: rule.description.clone(),
+                                pattern: Some(pattern.clone()),
+                                line_number: None,
+                                suggestion: format!("Add required pattern: {}", pattern),
+                            }
+                        );
                     }
-                    crate::core::db::RuleType::Warning => {
-                        let regex_result = Regex::new(pattern);
-                        let matches = if let Ok(re) = regex_result {
-                            re.is_match(&content_lower)
-                        } else {
-                            content_lower.contains(&pattern_lower)
-                        };
-
-                        if matches {
-                            drift_result.violations.push(
-                                crate::core::parser::DriftViolation {
-                                    rule_type: rule_type_str.to_string(),
-                                    rule_description: rule.description.clone(),
-                                    pattern: Some(pattern.clone()),
-                                    line_number: None,
-                                    suggestion: "Consider refactoring".to_string(),
-                                }
-                            );
-                        }
+                    crate::core::db::RuleType::Warning if matches => {
+                        drift_result.violations.push(
+                            crate::core::parser::DriftViolation {
+                                rule_type: rule_type_str.to_string(),
+                                rule_description: rule.description.clone(),
+                                pattern: Some(pattern.clone()),
+                                line_number: None,
+                                suggestion: "Consider refactoring".to_string(),
+                            }
+                        );
                     }
+                    _ => {}
                 }
             }
         }

@@ -1,6 +1,5 @@
 use crate::core::db::{Db, DB_PATH};
-use crate::core::parser::{Parser, DriftResult, DriftViolation};
-use regex::Regex;
+use crate::core::parser::{Parser, DriftViolation};
 use std::path::Path;
 use crate::core::db::RuleType;
 
@@ -35,70 +34,37 @@ pub fn run(file_path: String) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if let Some(pattern) = &rule.pattern {
-            let pattern_lower = pattern.to_lowercase();
-            let content_lower = content.to_lowercase();
+            let matches = crate::core::rule_engine::pattern_matches(&content, pattern);
 
             match rule.rule_type {
-                RuleType::Forbidden => {
-                    let regex_result = Regex::new(pattern);
-                    let matches = if let Ok(re) = regex_result {
-                        re.is_match(&content_lower)
-                    } else {
-                        content_lower.contains(&pattern_lower)
-                    };
-
-                    if matches {
-                        drift_result.violations.push(
-                            DriftViolation {
-                                rule_type: rule_type_str.to_string(),
-                                rule_description: rule.description.clone(),
-                                pattern: Some(pattern.clone()),
-                                line_number: None,
-                                suggestion: "Remove or refactor matching pattern".to_string(),
-                            }
-                        );
-                    }
+                RuleType::Forbidden if matches => {
+                    drift_result.violations.push(DriftViolation {
+                        rule_type: rule_type_str.to_string(),
+                        rule_description: rule.description.clone(),
+                        pattern: Some(pattern.clone()),
+                        line_number: None,
+                        suggestion: "Remove or refactor matching pattern".to_string(),
+                    });
                 }
-                RuleType::Required => {
-                    let regex_result = Regex::new(pattern);
-                    let has_pattern = if let Ok(re) = regex_result {
-                        re.is_match(&content_lower)
-                    } else {
-                        content_lower.contains(&pattern_lower)
-                    };
-
-                    if !has_pattern {
-                        drift_result.violations.push(
-                            DriftViolation {
-                                rule_type: rule_type_str.to_string(),
-                                rule_description: rule.description.clone(),
-                                pattern: Some(pattern.clone()),
-                                line_number: None,
-                                suggestion: format!("Add required pattern: {}", pattern),
-                            }
-                        );
-                    }
+                RuleType::Required if !matches => {
+                    drift_result.violations.push(DriftViolation {
+                        rule_type: rule_type_str.to_string(),
+                        rule_description: rule.description.clone(),
+                        pattern: Some(pattern.clone()),
+                        line_number: None,
+                        suggestion: format!("Add required pattern: {}", pattern),
+                    });
                 }
-                RuleType::Warning => {
-                    let regex_result = Regex::new(pattern);
-                    let matches = if let Ok(re) = regex_result {
-                        re.is_match(&content_lower)
-                    } else {
-                        content_lower.contains(&pattern_lower)
-                    };
-
-                    if matches {
-                        drift_result.violations.push(
-                            DriftViolation {
-                                rule_type: rule_type_str.to_string(),
-                                rule_description: rule.description.clone(),
-                                pattern: Some(pattern.clone()),
-                                line_number: None,
-                                suggestion: "Consider refactoring".to_string(),
-                            }
-                        );
-                    }
+                RuleType::Warning if matches => {
+                    drift_result.violations.push(DriftViolation {
+                        rule_type: rule_type_str.to_string(),
+                        rule_description: rule.description.clone(),
+                        pattern: Some(pattern.clone()),
+                        line_number: None,
+                        suggestion: "Consider refactoring".to_string(),
+                    });
                 }
+                _ => {}
             }
         }
     }

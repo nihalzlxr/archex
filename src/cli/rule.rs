@@ -147,7 +147,7 @@ pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
             println!("Testing {} rule(s) from module '{}' against {}:", rules.len(), module, file);
             println!();
             
-            use crate::core::parser::{Parser as ArchexParser, DriftResult, DriftViolation};
+            use crate::core::parser::{Parser as ArchexParser, DriftViolation};
             
             let mut drift_result = ArchexParser::check_drift(&file, &content);
             drift_result.module = module.clone();
@@ -160,52 +160,43 @@ pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if let Some(pattern) = &rule.pattern {
-                    let pattern_lower = pattern.to_lowercase();
-                    let content_lower = content.to_lowercase();
-                    
+                    let matches = crate::core::rule_engine::pattern_matches(&content, pattern);
+
                     match rule.rule_type {
-                        RuleType::Forbidden => {
-                            let matches = content_lower.contains(&pattern_lower);
-                            if matches {
-                                drift_result.violations.push(
-                                    DriftViolation {
-                                        rule_type: rule_type_str.to_string(),
-                                        rule_description: rule.description.clone(),
-                                        pattern: Some(pattern.clone()),
-                                        line_number: None,
-                                        suggestion: "Remove or refactor matching pattern".to_string(),
-                                    }
-                                );
-                            }
+                        RuleType::Forbidden if matches => {
+                            drift_result.violations.push(
+                                DriftViolation {
+                                    rule_type: rule_type_str.to_string(),
+                                    rule_description: rule.description.clone(),
+                                    pattern: Some(pattern.clone()),
+                                    line_number: None,
+                                    suggestion: "Remove or refactor matching pattern".to_string(),
+                                }
+                            );
                         }
-                        RuleType::Required => {
-                            let has_pattern = content_lower.contains(&pattern_lower);
-                            if !has_pattern {
-                                drift_result.violations.push(
-                                    DriftViolation {
-                                        rule_type: rule_type_str.to_string(),
-                                        rule_description: rule.description.clone(),
-                                        pattern: Some(pattern.clone()),
-                                        line_number: None,
-                                        suggestion: format!("Add required pattern: {}", pattern),
-                                    }
-                                );
-                            }
+                        RuleType::Required if !matches => {
+                            drift_result.violations.push(
+                                DriftViolation {
+                                    rule_type: rule_type_str.to_string(),
+                                    rule_description: rule.description.clone(),
+                                    pattern: Some(pattern.clone()),
+                                    line_number: None,
+                                    suggestion: format!("Add required pattern: {}", pattern),
+                                }
+                            );
                         }
-                        RuleType::Warning => {
-                            let matches = content_lower.contains(&pattern_lower);
-                            if matches {
-                                drift_result.violations.push(
-                                    DriftViolation {
-                                        rule_type: rule_type_str.to_string(),
-                                        rule_description: rule.description.clone(),
-                                        pattern: Some(pattern.clone()),
-                                        line_number: None,
-                                        suggestion: "Consider refactoring".to_string(),
-                                    }
-                                );
-                            }
+                        RuleType::Warning if matches => {
+                            drift_result.violations.push(
+                                DriftViolation {
+                                    rule_type: rule_type_str.to_string(),
+                                    rule_description: rule.description.clone(),
+                                    pattern: Some(pattern.clone()),
+                                    line_number: None,
+                                    suggestion: "Consider refactoring".to_string(),
+                                }
+                            );
                         }
+                        _ => {}
                     }
                 }
             }
