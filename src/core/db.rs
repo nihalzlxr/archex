@@ -69,7 +69,7 @@ impl Db {
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS modules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
+                name TEXT NOT NULL UNIQUE,
                 layer TEXT NOT NULL,
                 path_pattern TEXT NOT NULL
             )",

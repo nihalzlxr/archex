@@ -116,49 +116,47 @@ fn seed_nextjs_modules(db: &Db) -> usize {
         ("libs", "service", "src/libs/**"),
     ];
 
+    // Idempotent seeding: never duplicate an existing module.
+    let mut seeded = 0;
     for (name, layer, pattern) in &modules {
-        db.insert_module(name, layer, pattern).expect("Failed to insert module");
+        if db.get_module_id_by_name(name).ok().flatten().is_some() {
+            continue;
+        }
+        db.insert_module(name, layer, pattern)
+            .expect("Failed to insert module");
+        seeded += 1;
     }
 
-    // Get the correct module IDs by name
-    let app_id = db.get_module_id_by_name("app").expect("Failed to get app module id");
-    let components_id = db.get_module_id_by_name("components").expect("Failed to get components module id");
-    let api_id = db.get_module_id_by_name("api").expect("Failed to get api module id");
-    let services_id = db.get_module_id_by_name("services").expect("Failed to get services module id");
+    // Rules: seed only for modules that exist and have no rules yet,
+    // so a re-init can never accumulate duplicate rules.
+    let rule_specs: &[(&str, &str, &str, Option<&str>)] = &[
+        ("app", "forbidden", "Direct database access in UI layer", Some("from.*@/db|from.*drizzle")),
+        ("app", "forbidden", "Direct API calls without hooks, use src/hooks", Some("fetch\\(|axios\\.")),
+        ("components", "forbidden", "No direct server calls from components", Some("from.*@/server")),
+        ("components", "warning", "Avoid business logic in components", Some("function |const .* =")),
+        ("api", "forbidden", "Direct database import in API route", Some("from.*@/db|from.*drizzle")),
+        ("api", "forbidden", "Business logic in API route, use services layer", Some("from.*@/services")),
+        ("api", "required", "API routes must validate input", Some("zod|yup|joi")),
+        ("services", "required", "Services must use db layer, not direct SQL", Some("from.*@/db|from.*drizzle")),
+    ];
 
-    // app rules
-    if let Some(id) = app_id {
-        db.insert_rule(id, "forbidden", "Direct database access in UI layer", Some("from.*@/db|from.*drizzle"))
-            .expect("Failed to insert rule");
-        db.insert_rule(id, "forbidden", "Direct API calls without hooks, use src/hooks", Some("fetch\\(|axios\\."))
-            .expect("Failed to insert rule");
-    }
-
-    // components rules
-    if let Some(id) = components_id {
-        db.insert_rule(id, "forbidden", "No direct server calls from components", Some("from.*@/server"))
-            .expect("Failed to insert rule");
-        db.insert_rule(id, "warning", "Avoid business logic in components", Some("function |const .* ="))
-            .expect("Failed to insert rule");
-    }
-
-    // api rules
-    if let Some(id) = api_id {
-        db.insert_rule(id, "forbidden", "Direct database import in API route", Some("from.*@/db|from.*drizzle"))
-            .expect("Failed to insert rule");
-        db.insert_rule(id, "forbidden", "Business logic in API route, use services layer", Some("from.*@/services"))
-            .expect("Failed to insert rule");
-        db.insert_rule(id, "required", "API routes must validate input", Some("zod|yup|joi"))
-            .expect("Failed to insert rule");
-    }
-
-    // services rules
-    if let Some(id) = services_id {
-        db.insert_rule(id, "required", "Services must use db layer, not direct SQL", Some("from.*@/db|from.*drizzle"))
+    for &(module_name, rule_type, description, pattern) in rule_specs {
+        let module_id = match db.get_module_id_by_name(module_name).ok().flatten() {
+            Some(id) => id,
+            None => continue,
+        };
+        let has_rules = db
+            .get_rules_for_module(module_id)
+            .map(|r| !r.is_empty())
+            .unwrap_or(false);
+        if has_rules {
+            continue;
+        }
+        db.insert_rule(module_id, rule_type, description, pattern)
             .expect("Failed to insert rule");
     }
 
     let rule_count = db.get_rule_count().expect("Failed to get rule count");
-    eprintln!("Seeded {} modules with {} rules.", modules.len(), rule_count);
-    modules.len()
+    eprintln!("Seeded {} new modules; {} rules total.", seeded, rule_count);
+    seeded
 }

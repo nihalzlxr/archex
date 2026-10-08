@@ -107,6 +107,9 @@ impl Parser {
 
             if let Some((module, _)) = matched_module {
                 self.db.upsert_file(&relative_path, module.id)?;
+                // Replace any previous index rows for this file — a re-scan
+                // must never duplicate symbols or imports.
+                self.db.clear_file_symbols(&relative_path)?;
                 files_mapped += 1;
 
                 if let Ok(content) = fs::read_to_string(file_path) {
