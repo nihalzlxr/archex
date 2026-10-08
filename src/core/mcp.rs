@@ -512,6 +512,9 @@ impl ArchexService {
             }
         }
 
+        // `clean` is derived — recompute after the rules loop pushed violations.
+        drift_result.recompute_clean();
+
         let result_json = serde_json::json!({
             "file_path": drift_result.file_path,
             "module": drift_result.module,

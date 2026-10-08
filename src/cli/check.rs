@@ -103,6 +103,9 @@ pub fn run(file_path: String) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // `clean` is derived — recompute after the rules loop pushed violations.
+    drift_result.recompute_clean();
+
     if drift_result.clean {
         println!("✓ {}: Clean - no forbidden violations found", file_path);
         for v in &drift_result.violations {

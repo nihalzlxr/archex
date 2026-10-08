@@ -1,12 +1,6 @@
 use crate::core::db::{Db, RuleType, DB_PATH};
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use std::path::Path;
-
-#[derive(Parser)]
-pub struct RuleCli {
-    #[command(subcommand)]
-    command: RuleCommands,
-}
 
 #[derive(Subcommand)]
 pub enum RuleCommands {
@@ -36,11 +30,10 @@ pub enum RuleCommands {
     },
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = RuleCli::parse();
+pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
     let db = Db::open(Path::new(DB_PATH))?;
 
-    match cli.command {
+    match command {
         RuleCommands::List { module } => {
             if let Some(name) = module {
                 let module_id = db.get_module_id_by_name(&name)?
@@ -217,6 +210,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             
+            // `clean` is derived — recompute after the loop pushed violations.
+            drift_result.recompute_clean();
+
             if drift_result.clean {
                 println!("[OK] All rules passed - no violations found");
             } else {

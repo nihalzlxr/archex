@@ -145,11 +145,11 @@ fn seed_nextjs_modules(db: &Db) -> usize {
             Some(id) => id,
             None => continue,
         };
-        let has_rules = db
-            .get_rules_for_module(module_id)
-            .map(|r| !r.is_empty())
+        // Idempotent per rule: seed only this exact rule if it is absent.
+        let exists = db
+            .rule_exists(module_id, rule_type, description, pattern)
             .unwrap_or(false);
-        if has_rules {
+        if exists {
             continue;
         }
         db.insert_rule(module_id, rule_type, description, pattern)

@@ -312,6 +312,17 @@ impl Db {
         self.conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
     }
 
+    pub fn rule_exists(&self, module_id: i64, rule_type: &str, description: &str, pattern: Option<&str>) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM rules
+             WHERE module_id = ?1 AND rule_type = ?2 AND description = ?3
+               AND ((?4 IS NULL AND pattern IS NULL) OR pattern = ?4)",
+            (module_id, rule_type, description, pattern),
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn delete_rule(&self, rule_id: i64) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM rules WHERE id = ?1", [rule_id])?;

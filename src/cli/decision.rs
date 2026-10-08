@@ -1,12 +1,6 @@
 use crate::core::db::{Db, DB_PATH};
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use std::path::Path;
-
-#[derive(Parser)]
-pub struct DecisionCli {
-    #[command(subcommand)]
-    command: DecisionCommands,
-}
 
 #[derive(Subcommand)]
 pub enum DecisionCommands {
@@ -28,11 +22,10 @@ pub enum DecisionCommands {
     },
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = DecisionCli::parse();
+pub fn run(command: DecisionCommands) -> Result<(), Box<dyn std::error::Error>> {
     let db = Db::open(Path::new(DB_PATH))?;
 
-    match cli.command {
+    match command {
         DecisionCommands::Add { title, context, decision } => {
             db.insert_decision(&title, context.as_deref(), &decision)?;
             

@@ -36,6 +36,18 @@ pub struct DriftResult {
     pub clean: bool,
 }
 
+impl DriftResult {
+    /// Recompute `clean` from the current violations. Must be called after
+    /// pushing violations onto an existing result — `clean` is a derived
+    /// value and is stale the moment the violation list changes.
+    pub fn recompute_clean(&mut self) {
+        self.clean = self
+            .violations
+            .iter()
+            .all(|v| v.rule_type != "forbidden");
+    }
+}
+
 const SKIP_DIRS: &[&str] = &["node_modules", ".next", ".git", "dist", "build", "target"];
 
 const VALID_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "rs", "py"];
