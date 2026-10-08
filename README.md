@@ -1,130 +1,127 @@
 # Archex
 
-A local-first MCP server that acts as the **senior developer brain** behind any AI coding agent.
+**The architecture ledger and enforcement gate for AI coding agents.**
 
-It knows your codebase. When your AI agent needs to build something, Archex gives it a complete, architecture-aware plan — the right files, the right patterns, the rules to follow, the security checklist — before a single line is written.
+Archex sits between your team and your AI coding agents — Claude Code, Cursor, opencode, Windsurf, any MCP client. It remembers what was decided and why, hands that knowledge to every agent session automatically, and blocks changes that break your architecture before they merge.
 
----
-
-## The Problem
-
-When a developer uses an AI coding agent on a real production codebase, the agent has no awareness of:
-- What already exists and where
-- How the project is structured
-- What patterns and rules to follow
-- What other modules are affected by a change
-
-The result: blind code generation that breaks architecture, duplicates logic, skips security, and creates hours of rework.
+One Rust binary. Local-first. Vendor-neutral. No accounts, no servers, no API keys.
 
 ---
 
-## How It Works
+## Why
 
-```
-Developer: "add fee payment reminders"
-       ↓
-Archex (MCP tool: create_plan)
-  - scans existing codebase
-  - finds relevant modules: jobs, services, notifications, db
-  - identifies existing patterns to reuse
-  - generates step-by-step plan with exact file paths
-  - attaches rules: no DB in jobs, validate inputs, use existing notification service
-       ↓
-AI Agent (opencode / Claude Code / Cursor)
-  - receives structured plan
-  - executes with full context
-  - no guessing, no drift
-```
+Every agent session starts as a new hire. It re-learns your structure, guesses conventions from nearby files, and re-introduces things you rejected last month. You pay in review time — and review time is the real cost of AI-assisted development.
+
+A CLAUDE.md file can't fix this: it's advice the model can ignore under pressure, it goes stale, and nothing checks it. Archex is the same knowledge made **structured, versioned, queryable, automatically injected, and enforced**.
 
 ---
 
-## Quick Start
+## Features
+
+| Feature | What you get |
+|---|---|
+| **Architecture memory** | Layers, boundary rules, and past decisions are injected into every agent session automatically — no re-explaining, no prompt rituals |
+| **The gate** | Rules enforced in CI with file, line, and a plain-English fix. Breaking a boundary fails the PR in seconds, not in review |
+| **Baseline mode** | Existing violations are recorded once — only *new* violations block. Old debt burns down deliberately |
+| **Task ledger** | Stop Friday, resume Monday in any agent — goal, plan, decisions, and where you stopped travel with the branch |
+| **Agent write-back** | Agents record what they learn (`record_decision`); merging the PR turns it into team memory |
+| **Blast radius** | "If I change this, what breaks?" answered before the refactor, not discovered in review |
+| **Symbol search** | Search `user`, find `getUserById` — word-split full-text over every indexed symbol |
+| **Git is the sync layer** | Teammates get new rules and decisions with `git pull`. Zero per-machine setup |
+| **Signatures first** | Context is served as compact signatures with token budgets — agents read maps, not whole files |
+
+---
+
+## Quick start
 
 ```bash
-# Build
-cargo build --release
+# Install (from source)
+cargo install --path .
 
-# Initialize - scan your codebase and build context DB
-./target/release/archex init
-
-# Start MCP server (for use with AI agents)
-./target/release/archex serve
+# In your repo:
+archex init       # scan the codebase, build the index
+archex setup      # auto-detect your agent, write its MCP config
+archex sync       # import rules/decisions from git into the local index
 ```
 
----
+Add the gate to CI (GitHub Actions example):
 
-## MCP Tools
-
-### 1. `get_context(file_path)`
-Returns module, layer, and rules for a specific file. Used by AI before editing.
-
-### 2. `get_module(module_name)`
-Returns all files in a module, their purpose, key exports, and inter-module dependencies.
-
-### 3. `create_plan(feature_description)`
-Takes a plain English feature request. Returns:
-- Which modules are involved
-- Exact file paths to create or modify
-- Existing patterns to follow
-- Security checklist
-- Step-by-step implementation order
-- Rules that apply
-
----
-
-## Integration
-
-Add to your `opencode.json`:
-
-```json
-{
-  "mcp": {
-    "archex": {
-      "type": "local",
-      "enabled": true,
-      "command": ["/path/to/archex", "serve"],
-      "cwd": "/your/project",
-      "env": {
-        "OPENROUTER_API_KEY": "your_key_here"
-      }
-    }
-  }
-}
+```yaml
+- name: archex gate
+  run: |
+    curl -sSL https://releases.archex.dev/install.sh | sh   # or: cargo install archex
+    archex check --ci
 ```
 
+The first time a violation exists that you accept as existing debt: `archex check --update-baseline` records it, and CI only fails on new violations from then on.
+
 ---
 
-## Commands
+## How it works
+
+| Piece | Role |
+|---|---|
+| **CLI** | `init`, `sync`, `serve`, `check`, `decide`, `status` |
+| **MCP server** (stdio) | What agents talk to. A generated brief — layers, boundary rules, active decisions — is delivered to every session automatically. Agents pull detailed slices through tools and push learnings via `record_decision` |
+| **CI job** | The real gate. Builds an ephemeral index from the PR's code, reads committed rules and baseline, returns an exit code. Stores nothing between runs |
+| **Local index** | SQLite at `.archex/archex.db` — a derived cache, rebuilt from code + committed files. Never committed |
+
+### What lives in git
+
+```
+.archex/
+  config.toml                  # modules + layers (reviewed in PRs like code)
+  rules/<id>.toml              # one rule per file
+  decisions/<ULID>-<slug>.md    # one decision per file, append-only
+  tasks/<id>.md                # task ledger, travels with the feature branch
+  baseline.toml                # accepted existing violations
+```
+
+Everything is plain text: merge-conflict-free by design (one file per record, ULID names), reviewed in pull requests, and readable by humans and agents alike.
+
+---
+
+## MCP tools
+
+| Tool | Description |
+|---|---|
+| `get_context(file_path)` | Module, layer, rules, and relevant decisions for a file — before editing |
+| `search(query)` | Ranked symbol search (word-split, camelCase-aware) |
+| `traverse(symbols, direction, hops)` | Impact subgraph — who imports, who calls, what breaks |
+| `read(symbols)` | Signatures by default, full code on demand |
+| `record_decision(...)` | Agent write path — proposals accepted when the PR merges |
+| `check_drift(file_path)` | Fast advisory violation check during editing (CI is the guarantee) |
+
+## CLI
 
 | Command | Description |
-|---------|-------------|
-| `archex init` | Parse codebase, build context DB |
-| `archex refresh` | Re-sync after large changes |
-| `archex serve` | Start MCP server (stdio) |
+|---|---|
+| `archex init` | Scan the codebase and build the local index |
+| `archex sync` | Import changed rules/decisions/tasks from git; re-parse changed files |
+| `archex serve` | Start the MCP server (stdio) |
+| `archex check` | Run the gate locally (`--update-baseline`, `--ci` for CI mode) |
+| `archex decide` | Browse and manage the decision log |
+| `archex status` | Sync state, active rules, violations vs baseline |
 
 ---
 
-## What It Stores
+## Requirements
 
-SQLite database (`.archex/db.sqlite`):
+- **No API keys. No accounts. No outbound network calls.** Archex never talks to an LLM and never sends data anywhere — it's the memory and the rulebook; your agents bring the intelligence
+- A Rust toolchain to build from source, or a prebuilt release binary
+- `git` (the sync layer)
+- Any MCP-capable coding agent
+- Any CI system for the gate
 
-| Table | Description |
-|-------|-------------|
-| `modules` | name, layer, path pattern |
-| `rules` | forbidden/required/warning per module |
-| `file_map` | file path → module mapping |
-| `decisions` | architectural decisions log |
+## Storage & privacy
 
----
+- The index is a **derived cache** — delete it and `archex sync` rebuilds it from code + committed files
+- SQLite and all parsing (tree-sitter: TypeScript/TSX, JavaScript/JSX, Rust, Python) are embedded in the single binary
+- The team's architectural memory lives in git, gets code review like code, and works offline
 
-## Tech Stack
+## Works with
 
-| Component | Technology |
-|-----------|-----------|
-| Language | Rust |
-| MCP server | rmcp |
-| Storage | SQLite |
-| Code parsing | tree-sitter |
+Claude Code · Cursor · opencode · Windsurf · Continue · any MCP client
 
 ---
 
