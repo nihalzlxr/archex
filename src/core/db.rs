@@ -11,6 +11,7 @@ pub const DB_PATH: &str = ".archex/archex.db";
 /// One SQLite connection per DB file, behind a mutex. WAL lets readers run
 /// while a writer holds the write lock, so a single shared connection is both
 /// faster and safer than the five the MCP server used to open per process.
+#[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
     /// Repo root this DB belongs to: every file path is normalized against it,
@@ -249,10 +250,14 @@ impl Db {
                 imported_from TEXT NOT NULL,
                 imported_names TEXT NOT NULL,
                 module_id INTEGER NOT NULL,
+                resolved_to TEXT,
                 FOREIGN KEY(module_id) REFERENCES modules(id)
             )",
             [],
         )?;
+
+        // The DB is a derived cache, but a stale one should still open.
+        let _ = conn.execute("ALTER TABLE imports ADD COLUMN resolved_to TEXT", []);
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(file_path)",
@@ -489,6 +494,16 @@ impl Db {
         Ok(rows)
     }
 
+    /// In-memory database for tests. No journal for `:memory:`.
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        })
+    }
+
     /// Every file this index knows about, repo-relative. The retrieval
     /// universe: any eval or ranking must score against this same set, or it
     /// is measuring coverage instead of ranking.
@@ -665,8 +680,8 @@ impl Db {
         for import in imports {
             let names_json = serde_json::to_string(&import.imported_names).unwrap_or_else(|_| "[]".to_string());
             tx.execute(
-                "INSERT INTO imports (file_path, imported_from, imported_names, module_id) VALUES (?1, ?2, ?3, ?4)",
-                (import.file_path.as_str(), import.imported_from.as_str(), names_json.as_str(), import.module_id),
+                "INSERT INTO imports (file_path, imported_from, imported_names, module_id, resolved_to) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (import.file_path.as_str(), import.imported_from.as_str(), names_json.as_str(), import.module_id, import.resolved_to.as_deref()),
             )?;
         }
         tx.commit()?;
@@ -741,7 +756,7 @@ impl Db {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, file_path, imported_from, imported_names, module_id FROM imports WHERE {}",
+            "SELECT id, file_path, imported_from, imported_names, module_id, resolved_to FROM imports WHERE {}",
             Self::path_match("file_path")
         ))?;
         let imports = stmt.query_map([&file_path], |row| {
@@ -753,6 +768,7 @@ impl Db {
                 imported_from: row.get(2)?,
                 imported_names,
                 module_id: row.get(4)?,
+                resolved_to: row.get(5)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -925,6 +941,9 @@ pub struct Import {
     pub imported_from: String,
     pub imported_names: Vec<String>,
     pub module_id: i64,
+    /// Repo-relative target when the specifier resolved, `None` when it did
+    /// not. `None` means UNCLASSIFIED -- it is never a violation.
+    pub resolved_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -941,18 +960,8 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    /// SQLite has no journal for `:memory:`, so WAL is configured best-effort
-    /// here instead of through `Db::open`.
-    fn open_in_memory() -> Result<Db> {
-        let conn = Connection::open_in_memory()?;
-        Ok(Db {
-            conn: Arc::new(Mutex::new(conn)),
-            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        })
-    }
-
     fn mem_db() -> Db {
-        let db = open_in_memory().expect("open in-memory");
+        let db = Db::open_in_memory().expect("open in-memory");
         db.init_schema().expect("init schema");
         db
     }
@@ -988,6 +997,7 @@ mod tests {
             imported_from: "@/db".to_string(),
             imported_names: vec!["db".to_string()],
             module_id,
+            resolved_to: None,
         }])
         .expect("insert imports");
         db

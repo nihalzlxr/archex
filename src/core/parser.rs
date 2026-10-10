@@ -1,5 +1,6 @@
 use crate::core::db::{Db, Import, Module, Symbol, SymbolType};
 use crate::core::paths;
+use crate::core::resolve::Resolver;
 use glob::Pattern;
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -59,6 +60,10 @@ impl Parser {
     }
 
     pub fn scan(&self, project_root: &Path) -> Result<ScanResult, Box<dyn std::error::Error>> {
+        // One resolver for the whole scan: tsconfig chains and workspace
+        // packages are repo-level facts, not per-file ones.
+        let resolver = Resolver::new(project_root).ok();
+
         let modules = self.db.get_all_modules().map_err(|e| format!("DB error: {}", e))?;
 
         let mut compiled_patterns: Vec<(Module, Pattern)> = modules
@@ -125,6 +130,7 @@ impl Parser {
                         module.id,
                         file_path,
                         &content,
+                        resolver.as_ref(),
                     );
                     
                     if !syms.is_empty() {
@@ -179,12 +185,13 @@ impl Parser {
         module_id: i64,
         path: &Path,
         content: &str,
+        resolver: Option<&Resolver>,
     ) -> (Vec<Symbol>, Vec<Import>) {
         let ext = path.extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        match ext {
+        let (symbols, mut imports) = match ext {
             "ts" | "tsx" | "js" | "jsx" => {
                 Self::extract_ts_symbols(file_path, module_id, content, path)
             }
@@ -195,7 +202,17 @@ impl Parser {
                 Self::extract_python_symbols(file_path, module_id, content)
             }
             _ => (Vec::new(), Vec::new()),
+        };
+
+        // Resolve after extraction rather than threading a resolver through
+        // every collector: the specifier is all that is needed, and one pass
+        // is easier to keep honest than resolution in six places.
+        if let Some(resolver) = resolver {
+            for import in imports.iter_mut() {
+                import.resolved_to = resolver.resolve(file_path, &import.imported_from);
+            }
         }
+        (symbols, imports)
     }
 
     fn extract_ts_symbols(
@@ -353,6 +370,7 @@ impl Parser {
                         imported_from,
                         imported_names: names,
                         module_id,
+                        resolved_to: None,
                     });
                 }
             }
@@ -366,16 +384,23 @@ impl Parser {
         }
     }
 
+    /// The specifier of an import statement. TypeScript accepts single and
+    /// double quotes and both appear in real repos; accepting only one drops
+    /// every import written the other way, silently.
     fn extract_ts_import_path(node: &tree_sitter::Node, content: &str) -> String {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                let kind = child.kind();
-                if kind == "string" {
-                    let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
-                    if text.starts_with('"') {
-                        return text[1..text.len()-1].to_string();
-                    }
+                if child.kind() != "string" {
+                    continue;
                 }
+                let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
+                let quote = match text.chars().next() {
+                    Some(q @ ('"' | '\'' | '`')) => q,
+                    _ => continue,
+                };
+                let inner = text.trim_start_matches(quote);
+                let inner = inner.strip_suffix(quote).unwrap_or(inner);
+                return inner.replace("\\'", "'").replace("\\\\", "\\");
             }
         }
         String::new()
@@ -561,6 +586,7 @@ if kind == "default_import" {
                 imported_from,
                 imported_names,
                 module_id: 0,
+                        resolved_to: None,
             })
         } else {
             None
@@ -680,6 +706,7 @@ if kind == "default_import" {
                 imported_from,
                 imported_names,
                 module_id: 0,
+                resolved_to: None,
             })
         } else {
             None
