@@ -1,6 +1,12 @@
 # archex v2 — Master Plan
 
-Status: agreed and frozen · Last updated: 2026-10-08
+Status: Steps 0–2 shipped · Last updated: 2026-10-10
+
+> Steps 0, 1 and 2 are built, tested and verified on two real repos
+> (`project/fitness`, and LORB — the deployment target). The build order and
+> exit tests in §11 are unchanged; §12.1 records the decisions taken while
+> building, including the two places the frozen plan turned out to be wrong.
+> `RESUME.md` is the handoff for whoever picks this up next.
 
 ---
 
@@ -56,12 +62,24 @@ A local code graph (who imports whom) feeds both. The graph is the engine, not t
 schema_version = 1
 name = "lerniq"
 layers = ["ui", "service", "db", "api"]   # top level, BEFORE any table
+test_globs = ["**/*.test.ts", "**/test/**"]   # added in Step 2
 
 [[module]]
 name = "components"
 layer = "ui"
 path = "src/components/**"
 ```
+
+`test_globs` skips those files in boundary rules unless a rule sets
+`include_tests = true`. The safe behaviour is the default one: a
+hand-written rule must not flag every test file on day one. Measured on
+fitness: 34 test-file-to-internals imports against 3 real ones.
+
+Every key is validated. `deny_unknown_fields` everywhere, plus: a top-level
+key placed after a `[[module]]` header is caught by name (TOML silently
+absorbs it, which would leave a valid config with no layers at all), module
+names must be unique, and a module in an undeclared layer is an error rather
+than a module that quietly matches nothing.
 
 ### rules/<id>.toml — one schema, three engines, `kind` selects
 
@@ -76,12 +94,35 @@ severity = "error"       # error = CI exit 1 | warning = report only
 from_layer = "ui"
 to_layer = "db"
 message = "UI must not import the db layer. Go through services."
-
 # [pattern]  → scope, mode (forbidden|required|warning), pattern, message
 # [presence] → applies_to, requires, message
 ```
 
-Validator rule: `kind` must match exactly one engine table. Rules are human-authored in v1; agents may only *suggest* one inside a decision.
+```toml
+[boundary]                     # added in Step 2, and load-bearing
+from_layer = "ui"              # a LAYER name or a MODULE name
+to_layer = "db"
+allow_to = ["packages/engine/src/index.ts"]   # exempt targets
+include_tests = false          # opt back into test_globs
+exclude = ["src/legacy/**"]    # anything else to skip
+message = "UI must not import the db layer. Go through services."
+```
+
+`allow_to` exists because a monorepo boundary is not a layer pair: reaching
+a package through its public entry is legitimate, reaching its internals is
+the violation. Without it, "ui must not import db" cannot express the
+difference and the rule is either useless or wrong.
+
+`from_layer`/`to_layer` resolve as layer-first, then module name. A name
+that is BOTH is only ambiguous when the two readings cover different
+modules — `name = "engine", layer = "engine"` is accepted, because both
+readings name the same set and cannot change what the rule means.
+
+Validator rule: `kind` must match exactly one engine table. Rules are
+human-authored in v1; agents may only *suggest* one inside a decision.
+Rules live in FILES, never in the database: plain text in git is the source
+of truth (§2.5), and a rule that exists only in a local index enforces
+nothing on anyone else's machine.
 
 ### decisions/<ULID>-<slug>.md — markdown + frontmatter
 
@@ -123,6 +164,12 @@ count = 3
 ```
 
 `archex check --update-baseline` records existing violations → CI fails only on *new* ones → old debt burns down deliberately.
+
+Boundary keys are `(rule, from_file, to_file)` and **never** a line number.
+A violation that moves down the file because someone added an import above
+it is the same violation; keying on lines makes the baseline rot into
+per-line bookkeeping within a day. Verified on LORB: a recorded violation
+moved from line 1 to line 6 and stayed absorbed.
 
 ## 6. The gate
 
@@ -170,14 +217,44 @@ File-level resolved imports first. **The hard part is TypeScript** — `tsconfig
 
 ## 11. Build order
 
-| # | Ship | Exit test — we don't advance without it |
-|---|---|---|
-| **0** | Truthful core: idempotent init, symbol dedup (`clear_file_symbols` wired), shared case-correct regex helper, `exported` + signature extraction fixes, WAL + one shared connection, path normalization, dead code deleted, generic module seeding, **fixture tests + full suite** | `init` twice clean; suite green |
-| **1** | **Eval harness**: ~20 real LORB commits, ground truth = files each commit touched; Hit@3, MRR, function accuracy; baselines = plain grep + current archex | Numbers recorded (they'll be bad — that's the point) |
-| **2** | **The Gate**: file-level import resolution, rules as data, `archex check` + CI job, baseline mode | ≥1 real violation caught on LORB; **zero false positives on a clean tree** |
-| **3** | **The Ledger**: file formats + validator, `archex sync`, brief injection, `decide` CLI, `record_decision` MCP tool | An agent logs a decision mid-session; the next session starts knowing it |
-| **4** | Retrieval surface: FTS5 word-split search, `search`/`traverse`/`read` with token budgets, stable ordering | Measurable gain over the Step 1 baseline |
-| **5** | Conditional: symbol edges, PageRank repo map | Only if Step 4 leaves retrieval as the proven bottleneck |
+| # | Ship | Exit test — we don't advance without it | Status |
+|---|---|---|---|
+| **0** | Truthful core: idempotent init, symbol dedup (`clear_file_symbols` wired), shared case-correct regex helper, `exported` + signature extraction fixes, WAL + one shared connection, path normalization, dead code deleted, generic module seeding, **fixture tests + full suite** | `init` twice clean; suite green | ✅ done — 176 tests, zero warnings |
+| **1** | **Eval harness**: ~20 real LORB commits, ground truth = files each commit touched; Hit@3, MRR, function accuracy; baselines = plain grep + current archex | Numbers recorded | ✅ done — see below. Run on `project/fitness`; LORB reserved for Step 2 (below) |
+| **2** | **The Gate**: file-level import resolution, rules as data, `archex check` + CI job, baseline mode | ≥1 real violation caught on LORB; **zero false positives on a clean tree** | ✅ done — both halves, on LORB |
+| **3** | **The Ledger**: file formats + validator, `archex sync`, brief injection, `decide` CLI, `record_decision` MCP tool | An agent logs a decision mid-session; the next session starts knowing it | ⬜ not started |
+| **4** | Retrieval surface: FTS5 word-split search, `search`/`traverse`/`read` with token budgets, stable ordering | Measurable gain over the Step 1 baseline | ⬜ not started |
+| **5** | Conditional: symbol edges, PageRank repo map | Only if Step 4 leaves retrieval as the proven bottleneck | ⬜ not started |
+
+### Measured results
+
+**Step 1 — retrieval (project/fitness, 17 eligible commits).** The numbers
+were supposed to be bad. They are:
+
+| system | Hit@1 | Hit@3 | Hit@5 | MRR | avg candidates |
+|---|---|---|---|---|---|
+| grep | 17.6% | 29.4% | 35.3% | 0.227 | 171.4 |
+| archex | 5.9% | 17.6% | 23.5% | 0.110 | 4.4 |
+
+archex loses to plain grep. Three separable causes, each visible per-commit:
+`find_similar` caps at 5 **symbols** (not files); symbol-name substring is
+the wrong axis; and paths, which carry most of the signal, are barely read.
+Every later step has to move this row.
+
+**Step 2 — the gate, on LORB (3666 files).** Import resolution: **10,522 of
+10,540 first-party imports resolve (99.8%)**; the 18 misses are CSS, JSON
+locales and gitignored generated files. On fitness it is 85/88 (96.6%).
+
+Zero false positives: **218 of 218 cross-module edges go through a package's
+public entry**, so the internals rule correctly reports nothing. That is a
+real pass, not an empty one — the rule loaded, had 34 from-files, 106
+to-files and 19 candidate edges, and examined every one.
+
+At least one real violation: a `domain → routes` rule found **5 genuine
+violations in LORB's own code** (features importing `@/app/actions/*`),
+none of them introduced by us. 14 candidate edges, 8 exempted as test
+files, 5 real. Baseline mode then absorbed those 5 as recorded debt and a
+sixth new one failed the build.
 
 **The real test:** Steps 1–4 deployed on LORB within a few weeks. Ship the slice, learn from real use, then decide on 4–5. Completing the plan before contact with reality is the failure mode.
 
@@ -202,6 +279,42 @@ MCP handlers are pure request-JSON → result-JSON functions — directly unit-t
 
 **Definition of done for every step: failing tests written first, then code, then the step's exit test.**
 
+### 12.1 Decisions taken while building Steps 0–2
+
+The plan above was frozen on 2026-10-08. Four things turned out to be wrong
+or incomplete once there was real code to measure. All four were changed
+with evidence, not taste.
+
+**1. The curated Next.js seed was deleted, not kept.** The plan said
+manifest-detected frameworks keep a curated module list with real layers.
+Measured on LORB: **10 of the 16 curated modules matched zero files**, 4 of
+the 8 seeded rules could never fire, and 77% of the repo was unclassified.
+On fitness it never fired at all (no `next` in the root manifest). A
+hardcoded guess about one codebase's layout is not something a manifest can
+vouch for. Modules now come from `config.toml`, drafted from the workspace
+layout and edited by a human.
+
+**2. Generic seeding could not guess layers, and did not try.** Top-level
+directory → module, layer = the directory name, verbatim. The reasoning
+that decided it: layers are load-bearing the moment Step 2 landed. A wrong
+semantic guess is not merely wrong context, it is a **false violation** from
+a rule that checks `from_layer`/`to_layer`. `src/internal/db` mislabelled
+`db` plus "ui must not import db" is the cries-wolf death scenario the plan
+names. A layer is a stable key; humans give it meaning in `config.toml`.
+
+**3. `config.toml` was pulled forward from Step 3.** Building the boundary
+engine against layers we knew were wrong is the "complete the plan before
+contact with reality" failure the plan warns about. The pull-forward was
+kept tight: the config parser and validator, and rule files. `sync`, the
+ledger and `decide` stayed in Step 3.
+
+**4. Unclassified must be visible, always.** `archex check` prints files in
+modules vs unclassified, and unclassified imports as their own count.
+Deriving the unclassified count from the index reported **zero** uncovered
+files in exactly the repos with the most of them (unmapped files never reach
+`file_map`), so the scan persists its coverage counters and check reads
+those. Unresolved imports are counted too — never violations, never hidden.
+
 ## 13. Metrics
 
 - **Product** (from Step 2 on): violations caught per PR; repeated architecture violations in merged PRs trending down.
@@ -221,19 +334,47 @@ MCP handlers are pure request-JSON → result-JSON functions — directly unit-t
 
 Embeddings. Vector DBs. Similar-chunk RAG. A better file-finder. Advice-only rules. PageRank-first. A server or account before a paid cloud tier. Agent-writable rules in v1.
 
-## 16. Bug triage reference (Step 0 scope)
+## 16. Bug triage reference (Step 0 scope) — ALL RESOLVED
 
 Fix what is on the path — do not polish what is being deleted:
 
-- Idempotent init (UNIQUE(name) on modules, no duplicate seeding)
-- Wire `clear_file_symbols` before batch inserts (no symbol duplication on re-scan)
-- Case-correct shared regex helper (compile against original content or use `(?i)`)
-- `exported` detection: walk to parent for `export_statement` / modifiers
-- Signature extraction: use `parameters`/`return_type` fields, cover arrow functions and function expressions
-- WAL + one shared connection (`OnceCell`)
-- Path normalization (absolute → repo-relative) on lookup
-- Delete dead parser functions + unused `reqwest` dependency
-- Generic module seeding (infer from directories/manifests, not the hardcoded Next.js list)
-- README/doc corrections (no phantom `refresh`, correct DB path)
+- Idempotent init (UNIQUE(name) on modules, no duplicate seeding) — done
+- Wire `clear_file_symbols` before batch inserts (no symbol duplication on re-scan) — done
+- Case-correct shared regex helper (compile against original content or use `(?i)`) — done
+- `exported` detection: walk to parent for `export_statement` / modifiers — done (and it had been returning `false` for **every** TS symbol)
+- Signature extraction: use `parameters`/`return_type` fields, cover arrow functions and function expressions — done
+- WAL + one shared connection (`OnceCell`) — done (`Db::shared`, one per path)
+- Path normalization (absolute → repo-relative) on lookup — done (`core/paths.rs`)
+- Delete dead parser functions + unused `reqwest` dependency — done; zero warnings
+- Generic module seeding (infer from directories/manifests, not the hardcoded Next.js list) — done
+- README/doc corrections (no phantom `refresh`, correct DB path) — done
+
+Bugs found *while* fixing these, which were not on the list:
+
+- `archex rule add` printed the total rule COUNT as the new rule's ID
+- `rule add` validated the rule type, then discarded the validated value
+- single-quoted import specifiers were dropped from the index entirely
+- re-exports (`export … from`), `require()` and dynamic `import()` were not
+  edges at all
+- `extends` was read from inside `compilerOptions`, dropping every tsconfig chain
+- scoped package names contain a slash, so splitting `@fitness/engine` on
+  the first slash tore the name in half and lost every scoped workspace link
+- `clear_modules` violated FK constraints once Step 0 had actually enabled them
+- a database predating schema versioning read as "fresh" and then failed on a missing column
+- `init` prompted when `.archex/` existed — which, once `config.toml` is committed, is always
 
 Explicitly **not** fixed: `create_plan` scoring and its hardcoded checklist — they die with the tool surface in Step 4.
+
+## 17. Open items
+
+1. **Rules still have two sources of truth.** The gate reads
+   `.archex/rules/*.toml`; `archex rule add`/`remove` and the MCP
+   `check_drift` / `check --file-path` paths still read DB rules. A rule
+   added through the CLI is therefore not committed and not enforced by the
+   gate. Decision: rules move to files everywhere. One loader, `rule add`
+   writes a validated file, `rule remove` retires by default (`--purge` to
+   delete), and `archex rule migrate` converts existing DB rules. The
+   `rules` table goes at the next schema bump. Not started.
+2. `check --file-path` and the pattern/presence engines still use the DB rule
+   path; they move with item 1.
+3. `create_plan` is 172 lines of dead weight scheduled for removal in Step 4.
