@@ -1,18 +1,21 @@
 # archex v2 — Master Plan
 
-Status: Steps 0–2 shipped · Last updated: 2026-10-10
+Status: Steps 0–2 shipped · Step 2.5 next · Last updated: 2026-10-10
 
 > Steps 0, 1 and 2 are built, tested and verified on two real repos
 > (`project/fitness`, and LORB — the deployment target). The build order and
 > exit tests in §11 are unchanged; §12.1 records the decisions taken while
 > building, including the two places the frozen plan turned out to be wrong.
-> `RESUME.md` is the handoff for whoever picks this up next.
+> §18 is the verified competitive landscape (researched 2026-10-10); §19
+> folds its steals into the remaining steps. **Step 2.5** (§11) is the next
+> task: one source of truth for rules, before the ledger. `RESUME.md` is
+> the handoff for whoever picks this up next.
 
 ---
 
 ## 1. The product
 
-**Archex is an architecture ledger plus an enforcement gate for AI coding agents.** One Rust binary, local-first, vendor-neutral. Two things teams currently can't get:
+**Archex is an architecture ledger plus an enforcement gate for AI coding agents.** One Rust binary, local-first, vendor-neutral. Two halves, one system:
 
 1. **REMEMBER** — why the code is built the way it is, handed to every agent session automatically.
 2. **BLOCK** — changes that break the architecture, in CI, with file and line numbers.
@@ -20,6 +23,8 @@ Status: Steps 0–2 shipped · Last updated: 2026-10-10
 A local code graph (who imports whom) feeds both. The graph is the engine, not the product.
 
 **The problem:** every agent session starts as a new hire. It re-learns structure, guesses conventions, re-introduces things you rejected last month. You pay in review time — and review time is the real cost of AI-written code (45% of merged AI PRs need revision; feedback loops are 35.8% of agent conversations). A CLAUDE.md file can't fix this: it's advice, it goes stale, the model ignores it under pressure, and nothing checks it. Archex is the same knowledge made structured, versioned, queryable, injected, and **enforced**.
+
+**Positioning (verified against the landscape, §18):** both halves exist separately in the market — Archcore ships git-native context with no deterministic gate; Mneme ships decisions + literal-text enforcement with no code graph; dependency-cruiser ships a graph gate with no decisions. The open quadrant is **decision-linked enforcement over the resolved import graph, in per-file plain text**. That integration is what archex is. Never claim "no competitors"; claim the quadrant.
 
 ## 2. Locked principles
 
@@ -189,6 +194,8 @@ Three engines, one discipline each:
 
 Decisions accumulate as the team's shared memory, reviewed in PRs like code, versioned like code, offline, no account. Sync + injection means a teammate's `git pull` gives *their* agents your new decisions automatically. Authority ordering is explicit: authored rules > agent-proposed decisions, always.
 
+**Honest differentiator notes (from the landscape research, §18):** the task ledger is *parity*, not a wedge — Archcore's `.plan.md` files carry tasks and their review closes them; we keep ours because state continuity feeds the loop, not because it's unique. The real edges are: (a) the integration quadrant itself, (b) one-file-per-record git-native storage (Mneme's corpus is a single `project_memory.json` — the merge-conflict trap this design exists to avoid), (c) the zero-runtime single binary.
+
 ## 8. Sync contract
 
 `archex sync` is idempotent and hash-driven:
@@ -222,6 +229,7 @@ File-level resolved imports first. **The hard part is TypeScript** — `tsconfig
 | **0** | Truthful core: idempotent init, symbol dedup (`clear_file_symbols` wired), shared case-correct regex helper, `exported` + signature extraction fixes, WAL + one shared connection, path normalization, dead code deleted, generic module seeding, **fixture tests + full suite** | `init` twice clean; suite green | ✅ done — 176 tests, zero warnings |
 | **1** | **Eval harness**: ~20 real LORB commits, ground truth = files each commit touched; Hit@3, MRR, function accuracy; baselines = plain grep + current archex | Numbers recorded | ✅ done — see below. Run on `project/fitness`; LORB reserved for Step 2 (below) |
 | **2** | **The Gate**: file-level import resolution, rules as data, `archex check` + CI job, baseline mode | ≥1 real violation caught on LORB; **zero false positives on a clean tree** | ✅ done — both halves, on LORB |
+| **2.5** | **One source of truth for rules.** Gate, `check --file-path` and MCP `check_drift` load `.archex/rules/*.toml` through **one loader and one engine**. `rule add` writes a validated file through the real validator (canonical serialization; flags grow `--from --to --allow-to --severity`, or boundary rules stay CLI-unreachable); `rule remove` **retires** by default (`status = "retired"`), `--purge` deletes; `archex rule migrate` converts DB rules — refusing any whose module has no layer in `config.toml` — then the `rules` table dies at the next schema bump. Legacy DB rules warn once on startup, then migrate | The same fixture run through the CI path and the per-file advisory path produces **identical findings** — advisory and gate must never disagree, or agents learn to distrust the advisory | ⬜ next — full approach in `RESUME.md` |
 | **3** | **The Ledger**: file formats + validator, `archex sync`, brief injection, `decide` CLI, `record_decision` MCP tool | An agent logs a decision mid-session; the next session starts knowing it | ⬜ not started |
 | **4** | Retrieval surface: FTS5 word-split search, `search`/`traverse`/`read` with token budgets, stable ordering | Measurable gain over the Step 1 baseline | ⬜ not started |
 | **5** | Conditional: symbol edges, PageRank repo map | Only if Step 4 leaves retrieval as the proven bottleneck | ⬜ not started |
@@ -367,14 +375,73 @@ Explicitly **not** fixed: `create_plan` scoring and its hardcoded checklist — 
 
 ## 17. Open items
 
-1. **Rules still have two sources of truth.** The gate reads
-   `.archex/rules/*.toml`; `archex rule add`/`remove` and the MCP
-   `check_drift` / `check --file-path` paths still read DB rules. A rule
-   added through the CLI is therefore not committed and not enforced by the
-   gate. Decision: rules move to files everywhere. One loader, `rule add`
-   writes a validated file, `rule remove` retires by default (`--purge` to
-   delete), and `archex rule migrate` converts existing DB rules. The
-   `rules` table goes at the next schema bump. Not started.
+1. **Rules still have two sources of truth** — now **Step 2.5** in the build
+   order (§11), full approved approach in `RESUME.md`. Note the trap inside
+   the task: today's `rule add` flags (`--module --rule-type --description
+   --pattern`) cannot express a boundary rule at all, so the CLI must grow
+   `--from --to --allow-to --severity` in the same unit, or the headline
+   feature of Step 2 stays CLI-unreachable and the migration is half-done.
 2. `check --file-path` and the pattern/presence engines still use the DB rule
-   path; they move with item 1.
+   path; they move with Step 2.5.
 3. `create_plan` is 172 lines of dead weight scheduled for removal in Step 4.
+
+## 18. Landscape (verified 2026-10-10)
+
+Researched via GitHub API and primary sources (READMEs, ADRs, rule-engine
+docs). All claims below were checked against the actual repos.
+
+| Project | What it is (verified) | State |
+|---|---|---|
+| **Archcore** (archcore-ai) | Spec-driven dev + git-native context. `.archcore/` docs typed by filename (`.adr.md .rule.md .plan.md .spec.md`). `/plan` (specs+tasks, S–XL sizing), `/document`, `/review` — **bidirectional** (`code-wrong` vs `spec-wrong`). Imports existing CLAUDE.md/AGENTS.md. 8 agent integrations. **No deterministic gate** — review is LLM-driven | 68★, org-backed, installer, active daily |
+| **Mneme** (MnemeHQ) | Decision + control layer: ADRs → deterministic guardrails. Retrieval/enforcement explicitly separated (their ADR-017); verdicts *traced to source decisions*; frozen 6-tool MCP, agents can only **propose**, humans accept via CLI; fail-closed authority; 4-tier boundaries (injection → pre-tool hooks → post-mutation audit → CI). **Enforcement is literal text matching only** (ADR-019: exact, case-sensitive, no graph) | 25★, Python, very active, ADR-dogfooded |
+| **ArchSteer** | "Living architecture control plane" — derive arch from code, auto-draft ADRs, fitness functions | 5★, stalled since July |
+| **dependency-cruiser** | The mature TS/JS graph gate: forbidden/allowed/required rules, `reachable` (transitive), 25+ typed import kinds, `--ignore-known` baseline, `extends` shareable rule sets | ~5k★, category standard |
+| **Sheriff, Nx boundaries, import-linter, ArchUnit** | Mature gate category; ArchUnit's `FreezingArchRule` = our baseline mode, proven since 2019 | — |
+
+**Corrections to earlier wedge claims:** decision-linked violations — Mneme
+has them (verdicts traced to decisions). Task ledger — Archcore's plans carry
+tasks and review closes them; parity, not a wedge. The surviving quadrant:
+
+| | Decisions in git | Deterministic gate | Import-graph rules |
+|---|---|---|---|
+| Archcore | ✓ | ✗ | ✗ |
+| Mneme | ✓ | ✓ | ✗ (literal text only) |
+| dep-cruiser & co. | ✗ | ✓ | ✓✓ |
+| **archex** | ✓ | ✓ | ✓ |
+
+Pitch line: *dependency-cruiser has the graph but doesn't know why; Mneme
+knows why but can't see the graph.* Also structural: Mneme's corpus is a
+single `project_memory.json` — the exact merge-conflict trap our
+one-file-per-record design exists to avoid.
+
+## 19. Schema and engine refinements (from the landscape, fold into 2.5–4)
+
+Steals with sources. Each is small now, expensive after Step 3+.
+
+1. **`literal` rule kind** (Mneme ADR-019): exact, **case-sensitive**, with
+   identifier-boundary matching — forbidding `legacy_client` must not fire on
+   `legacy_client_v2`. One semantic per kind: the current `pattern` kind is
+   regex-with-substring-fallback — two meanings in one type, and the fallback
+   fires silently. Split: `literal` (exact + boundary-aware) and `pattern`
+   (regex-only — an invalid regex fails **validation**, never silently
+   becomes a substring match).
+2. **Rule self-reference exemption** (Mneme): a rule never evaluates against
+   the file that declares it. Our rule TOMLs carry pattern text in `message`;
+   the engine must not scan `.archex/` anyway — make both explicit in the
+   engine spec.
+3. **`reachable = false` on `[boundary]`** (dependency-cruiser): schema field
+   now, engine later — "ui must not import db, directly or via anything."
+   Direct-edge-only is a toy gate; services-layer laundering defeats it.
+   Default `false` keeps Step 2 semantics unchanged.
+4. **Import classification: 5 kinds** — `relative | aliased | package |
+   type-only | dynamic`, everything else unclassified (dependency-cruiser has
+   25; we take the 5 that matter). The killer detail: **`import type` is
+   exempt from boundary rules** — type-only imports cannot create runtime
+   coupling, and counting them is a false-positive generator.
+5. **Future, post-Step-3** (steal list): `archex init --import` — absorb
+   existing CLAUDE.md/AGENTS.md/rules into decisions (Archcore proves
+   demand); `archex status` coverage report — which decisions are
+   *Protected / Rules-only / Guidance* (Mneme's Architecture Audit, an
+   honest onboarding surface); the 4-tier boundary vocabulary (injection →
+   pre-tool hooks → post-mutation audit → CI) as the target model — we ship
+   tiers 1+4, hooks and audit arrive later.
