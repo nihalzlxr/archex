@@ -1,12 +1,24 @@
 use rusqlite::{Connection, Result};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use serde::Serialize;
+
+use crate::core::paths;
 
 pub const DB_PATH: &str = ".archex/archex.db";
 
+/// One SQLite connection per DB file, behind a mutex. WAL lets readers run
+/// while a writer holds the write lock, so a single shared connection is both
+/// faster and safer than the five the MCP server used to open per process.
 pub struct Db {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
+    /// Repo root this DB belongs to: every file path is normalized against it,
+    /// so an absolute path from an agent resolves to the same row a scan wrote.
+    root: PathBuf,
 }
+
+static SHARED: OnceLock<Mutex<HashMap<PathBuf, Arc<Db>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Rule {
@@ -60,13 +72,106 @@ pub struct FileContext {
 }
 
 impl Db {
+    /// Borrow the connection. A poisoned lock means some other thread panicked
+    /// mid-statement; the data is still consistent (SQLite rolled back), so
+    /// recover rather than take the whole MCP server down with it.
+    fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn configure(conn: &Connection) -> Result<()> {
+        // busy_timeout must come first: it governs how long a writer waits for
+        // a lock instead of failing immediately.
+        conn.pragma_update(None, "busy_timeout", 5000i64)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // The schema declares FOREIGN KEYs; SQLite ignores them unless asked.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
+    }
+
+    /// The repo root a DB belongs to: two levels up from `<root>/.archex/x.db`.
+    fn root_for(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        absolute
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(cwd)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
         let conn = Connection::open(path)?;
-        Ok(Self { conn })
+        Self::configure(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            root: Self::root_for(path),
+        })
+    }
+
+    /// In-memory database for tests. No journal to speak of: SQLite keeps
+    /// `journal_mode = wal` unsupported for :memory: and that is fine.
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        Self::configure(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        })
+    }
+
+    /// The process-wide connection for `path`. Five MCP tools each opened their
+    /// own; they now share one, which is what makes WAL worth having.
+    pub fn shared(path: &Path) -> Result<Arc<Self>> {
+        let key = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        };
+        let registry = SHARED.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(&key) {
+            return Ok(existing.clone());
+        }
+        let db = Arc::new(Self::open(path)?);
+        map.insert(key, db.clone());
+        Ok(db)
+    }
+
+    /// Repo-relative canonical form of `file_path`, identical to what every
+    /// writer stores — so an agent's absolute path finds the row a scan wrote.
+    fn normalize(&self, file_path: &str) -> String {
+        paths::normalize_in(file_path, &self.root)
+    }
+
+    /// SQL predicate matching a stored path. On a case-insensitive filesystem
+    /// (`SRC/A.ts` and `src/a.ts` are one file there) an exact `=` would report
+    /// "no context" for a file that is indexed. On a case-sensitive one the two
+    /// really are different files, so the fallback stays off.
+    fn path_match(column: &str) -> String {
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            format!("LOWER({}) = LOWER(?1)", column)
+        } else {
+            format!("{} = ?1", column)
+        }
     }
 
     pub fn init_schema(&self) -> Result<()> {
-        self.conn.execute(
+        let conn = self.lock();
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS modules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -76,7 +181,7 @@ impl Db {
             [],
         )?;
 
-        self.conn.execute(
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 module_id INTEGER NOT NULL,
@@ -88,7 +193,7 @@ impl Db {
             [],
         )?;
 
-        self.conn.execute(
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS file_map (
                 file_path TEXT PRIMARY KEY,
                 module_id INTEGER NOT NULL,
@@ -98,7 +203,7 @@ impl Db {
             [],
         )?;
 
-        self.conn.execute(
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -109,14 +214,14 @@ impl Db {
             [],
         )?;
 
-        self.create_symbols_table()?;
-        self.create_imports_table()?;
+        Self::create_symbols_table(&conn)?;
+        Self::create_imports_table(&conn)?;
 
         Ok(())
     }
 
-    pub fn create_symbols_table(&self) -> Result<()> {
-        self.conn.execute(
+    pub fn create_symbols_table(conn: &Connection) -> Result<()> {
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS symbols (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_path TEXT NOT NULL,
@@ -131,15 +236,15 @@ impl Db {
             [],
         )?;
         
-        self.conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name)",
             [],
         )?;
-        self.conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path)",
             [],
         )?;
-        self.conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_symbols_module ON symbols(module_id)",
             [],
         )?;
@@ -147,8 +252,8 @@ impl Db {
         Ok(())
     }
 
-    pub fn create_imports_table(&self) -> Result<()> {
-        self.conn.execute(
+    pub fn create_imports_table(conn: &Connection) -> Result<()> {
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS imports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_path TEXT NOT NULL,
@@ -160,11 +265,11 @@ impl Db {
             [],
         )?;
 
-        self.conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(file_path)",
             [],
         )?;
-        self.conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_imports_module ON imports(module_id)",
             [],
         )?;
@@ -173,15 +278,17 @@ impl Db {
     }
 
     pub fn insert_module(&self, name: &str, layer: &str, path_pattern: &str) -> Result<i64> {
-        self.conn.execute(
+        let conn = self.lock();
+        conn.execute(
             "INSERT INTO modules (name, layer, path_pattern) VALUES (?1, ?2, ?3)",
             [name, layer, path_pattern],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn insert_rule(&self, module_id: i64, rule_type: &str, description: &str, pattern: Option<&str>) -> Result<()> {
-        self.conn.execute(
+        let conn = self.lock();
+        conn.execute(
             "INSERT INTO rules (module_id, rule_type, description, pattern) VALUES (?1, ?2, ?3, ?4)",
             (module_id, rule_type, description, pattern),
         )?;
@@ -189,7 +296,8 @@ impl Db {
     }
 
     pub fn get_all_modules(&self) -> Result<Vec<Module>> {
-        let mut stmt = self.conn.prepare("SELECT id, name, layer, path_pattern FROM modules")?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, name, layer, path_pattern FROM modules")?;
         let modules = stmt.query_map([], |row| {
             Ok(Module {
                 id: row.get(0)?,
@@ -204,28 +312,35 @@ impl Db {
     }
 
     pub fn upsert_file(&self, file_path: &str, module_id: i64) -> Result<()> {
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
-        self.conn.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO file_map (file_path, module_id, last_parsed) VALUES (?1, ?2, ?3)",
-            (file_path, module_id, now),
+            (&file_path, module_id, now),
         )?;
         Ok(())
     }
 
     pub fn get_context_for_file(&self, file_path: &str) -> Result<Option<FileContext>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.name, m.layer, r.rule_type, r.description, r.pattern
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
+        let sql = "SELECT m.name, m.layer, r.rule_type, r.description, r.pattern
              FROM file_map fm
              JOIN modules m ON fm.module_id = m.id
              LEFT JOIN rules r ON r.module_id = m.id
-             WHERE fm.file_path = ?1"
-        )?;
+             WHERE ";
+        let mut stmt = conn.prepare(&format!(
+            "{}{}",
+            sql,
+            Self::path_match("fm.file_path")
+        ))?;
 
-        let mut rows = stmt.query([file_path])?;
+        let mut rows = stmt.query([&file_path])?;
 
         let mut module_name: Option<String> = None;
         let mut layer: Option<String> = None;
@@ -264,9 +379,11 @@ impl Db {
     }
 
     pub fn get_module_for_file(&self, file_path: &str) -> Result<Option<(String, i64)>> {
-        let result: Result<(String, i64), _> = self.conn.query_row(
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
+        let result: Result<(String, i64), _> = conn.query_row(
             "SELECT m.name, fm.module_id FROM file_map fm JOIN modules m ON fm.module_id = m.id WHERE fm.file_path = ?1",
-            [file_path],
+            [&file_path],
             |row| Ok((row.get(0)?, row.get(1)?))
         );
         
@@ -277,7 +394,8 @@ impl Db {
     }
 
     pub fn get_rules_for_module(&self, module_id: i64) -> Result<Vec<Rule>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, rule_type, description, pattern FROM rules WHERE module_id = ?1"
         )?;
         
@@ -296,7 +414,8 @@ impl Db {
     }
 
     pub fn get_module_path(&self, module_name: &str) -> Result<Option<String>> {
-        let result: Result<String, _> = self.conn.query_row(
+        let conn = self.lock();
+        let result: Result<String, _> = conn.query_row(
             "SELECT path_pattern FROM modules WHERE name = ?1",
             [module_name],
             |row| row.get(0)
@@ -309,11 +428,13 @@ impl Db {
     }
 
     pub fn get_rule_count(&self) -> Result<i64> {
-        self.conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
     }
 
     pub fn rule_exists(&self, module_id: i64, rule_type: &str, description: &str, pattern: Option<&str>) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM rules
              WHERE module_id = ?1 AND rule_type = ?2 AND description = ?3
                AND ((?4 IS NULL AND pattern IS NULL) OR pattern = ?4)",
@@ -324,27 +445,30 @@ impl Db {
     }
 
     pub fn delete_rule(&self, rule_id: i64) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM rules WHERE id = ?1", [rule_id])?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn insert_decision(&self, title: &str, context: Option<&str>, decision: &str) -> Result<i64> {
+        let conn = self.lock();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO decisions (title, context, decision, created_at) VALUES (?1, ?2, ?3, ?4)",
             (title, context, decision, now),
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn list_decisions(&self, limit: usize) -> Result<Vec<(i64, String, Option<String>, String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, title, context, decision, created_at FROM decisions ORDER BY created_at DESC LIMIT ?1"
         )?;
         
@@ -364,9 +488,10 @@ impl Db {
     }
 
     pub fn search_decisions_db(&self, query: &str) -> Result<Vec<(i64, String, Option<String>, String, i64)>> {
+        let conn = self.lock();
         let pattern = format!("%{}%", query.to_lowercase());
         
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, title, context, decision, created_at FROM decisions 
              WHERE LOWER(title) LIKE ?1 OR LOWER(context) LIKE ?1 OR LOWER(decision) LIKE ?1
              ORDER BY created_at DESC LIMIT 20"
@@ -388,7 +513,8 @@ impl Db {
     }
 
     pub fn search_files(&self, keyword: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT file_path FROM file_map WHERE file_path LIKE ?1")?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT file_path FROM file_map WHERE file_path LIKE ?1")?;
         let pattern = format!("%{}%", keyword);
         let rows = stmt.query_map([pattern], |row| row.get(0))?;
         let mut files = Vec::new();
@@ -401,7 +527,8 @@ impl Db {
     }
 
     pub fn get_module_id_by_name(&self, name: &str) -> Result<Option<i64>> {
-        let result: Result<i64, _> = self.conn.query_row(
+        let conn = self.lock();
+        let result: Result<i64, _> = conn.query_row(
             "SELECT id FROM modules WHERE LOWER(name) = LOWER(?1) LIMIT 1",
             [name],
             |row| row.get(0)
@@ -413,7 +540,8 @@ impl Db {
     }
 
     pub fn get_module_info(&self, name: &str) -> Result<Option<ModuleInfo>> {
-        let result: Result<(i64, String, String), _> = self.conn.query_row(
+        let conn = self.lock();
+        let result: Result<(i64, String, String), _> = conn.query_row(
             "SELECT id, layer, path_pattern FROM modules WHERE LOWER(name) = LOWER(?1) LIMIT 1",
             [name],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -424,13 +552,13 @@ impl Db {
             Err(_) => return Ok(None),
         };
 
-        let file_count: i64 = self.conn.query_row(
+        let file_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM file_map WHERE module_id = ?1",
             [module_id],
             |row| row.get(0)
         )?;
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT file_path FROM file_map WHERE module_id = ?1"
         )?;
         let files: Vec<String> = stmt
@@ -438,7 +566,7 @@ impl Db {
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, rule_type, description, pattern FROM rules WHERE module_id = ?1"
         )?;
         let rules: Vec<Rule> = stmt
@@ -464,7 +592,8 @@ impl Db {
     }
 
     pub fn get_all_module_names(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT name FROM modules ORDER BY name")?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT DISTINCT name FROM modules ORDER BY name")?;
         let names: Vec<String> = stmt
             .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
@@ -473,10 +602,11 @@ impl Db {
     }
 
     pub fn find_relevant_modules(&self, keywords: &[String]) -> Result<Vec<ModuleContext>> {
+        let conn = self.lock();
         let mut results: Vec<(i64, String, String, String, Vec<String>)> = Vec::new();
 
         // Get all modules
-        let mut stmt = self.conn.prepare("SELECT id, name, layer, path_pattern FROM modules")?;
+        let mut stmt = conn.prepare("SELECT id, name, layer, path_pattern FROM modules")?;
         let modules: Vec<(i64, String, String, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
             .filter_map(|r| r.ok())
@@ -495,7 +625,7 @@ impl Db {
 
             if score > 0 {
                 // Get sample files (up to 5)
-                let mut file_stmt = self.conn.prepare(
+                let mut file_stmt = conn.prepare(
                     "SELECT file_path FROM file_map WHERE module_id = ?1 LIMIT 5"
                 )?;
                 let files: Vec<String> = file_stmt
@@ -504,7 +634,7 @@ impl Db {
                     .collect();
 
                 // Get rules
-                let mut rule_stmt = self.conn.prepare(
+                let mut rule_stmt = conn.prepare(
                     "SELECT rule_type, description, pattern FROM rules WHERE module_id = ?1"
                 )?;
                 let rules: Vec<String> = rule_stmt
@@ -538,7 +668,9 @@ impl Db {
     }
 
     pub fn insert_symbol(&self, file_path: &str, symbol_type: &str, name: &str, signature: Option<&str>, line_number: i64, module_id: i64, exported: bool) -> Result<i64> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
+        let tx = conn.unchecked_transaction()?;
         let result = tx.execute(
             "INSERT INTO symbols (file_path, symbol_type, name, signature, line_number, module_id, exported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (file_path, symbol_type, name, signature, line_number, module_id, exported as i32),
@@ -548,7 +680,8 @@ impl Db {
     }
 
     pub fn insert_symbols_batch(&self, symbols: &[Symbol]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
         for symbol in symbols {
             tx.execute(
                 "INSERT INTO symbols (file_path, symbol_type, name, signature, line_number, module_id, exported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -560,8 +693,10 @@ impl Db {
     }
 
     pub fn insert_import(&self, file_path: &str, imported_from: &str, imported_names: &[String], module_id: i64) -> Result<i64> {
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
         let names_json = serde_json::to_string(imported_names).unwrap_or_else(|_| "[]".to_string());
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = conn.unchecked_transaction()?;
         let result = tx.execute(
             "INSERT INTO imports (file_path, imported_from, imported_names, module_id) VALUES (?1, ?2, ?3, ?4)",
             (file_path, imported_from, names_json.as_str(), module_id),
@@ -571,7 +706,8 @@ impl Db {
     }
 
     pub fn insert_imports_batch(&self, imports: &[Import]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
         for import in imports {
             let names_json = serde_json::to_string(&import.imported_names).unwrap_or_else(|_| "[]".to_string());
             tx.execute(
@@ -584,7 +720,8 @@ impl Db {
     }
 
     pub fn get_symbols_by_module(&self, module_id: i64) -> Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, file_path, symbol_type, name, signature, line_number, module_id, exported FROM symbols WHERE module_id = ?1"
         )?;
         let symbols = stmt.query_map([module_id], |row| {
@@ -606,10 +743,13 @@ impl Db {
     }
 
     pub fn get_symbols_by_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, symbol_type, name, signature, line_number, module_id, exported FROM symbols WHERE file_path = ?1"
-        )?;
-        let symbols = stmt.query_map([file_path], |row| {
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, file_path, symbol_type, name, signature, line_number, module_id, exported FROM symbols WHERE {}",
+            Self::path_match("file_path")
+        ))?;
+        let symbols = stmt.query_map([&file_path], |row| {
             let symbol_type_str: String = row.get(2)?;
             Ok(Symbol {
                 id: row.get(0)?,
@@ -628,10 +768,11 @@ impl Db {
     }
 
     pub fn search_symbols(&self, query: &str) -> Result<Vec<SymbolSearchResult>> {
+        let conn = self.lock();
         let query_lower = query.to_lowercase();
         let pattern = format!("%{}%", query_lower);
         
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT s.name, s.signature, s.file_path, m.name, s.symbol_type
              FROM symbols s
              JOIN modules m ON s.module_id = m.id
@@ -661,10 +802,13 @@ impl Db {
     }
 
     pub fn get_imports_by_file(&self, file_path: &str) -> Result<Vec<Import>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, imported_from, imported_names, module_id FROM imports WHERE file_path = ?1"
-        )?;
-        let imports = stmt.query_map([file_path], |row| {
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, file_path, imported_from, imported_names, module_id FROM imports WHERE {}",
+            Self::path_match("file_path")
+        ))?;
+        let imports = stmt.query_map([&file_path], |row| {
             let imported_names_str: String = row.get(3)?;
             let imported_names: Vec<String> = serde_json::from_str(&imported_names_str).unwrap_or_default();
             Ok(Import {
@@ -681,22 +825,29 @@ impl Db {
     }
 
     pub fn get_symbol_count(&self) -> Result<i64> {
-        self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
     }
 
     pub fn get_import_count(&self) -> Result<i64> {
-        self.conn.query_row("SELECT COUNT(*) FROM imports", [], |row| row.get(0))
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM imports", [], |row| row.get(0))
     }
 
     pub fn clear_file_symbols(&self, file_path: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM symbols WHERE file_path = ?1", [file_path])?;
-        tx.execute("DELETE FROM imports WHERE file_path = ?1", [file_path])?;
+        let conn = self.lock();
+        let file_path = self.normalize(file_path);
+        let tx = conn.unchecked_transaction()?;
+        let symbols_sql = format!("DELETE FROM symbols WHERE {}", Self::path_match("file_path"));
+        let imports_sql = format!("DELETE FROM imports WHERE {}", Self::path_match("file_path"));
+        tx.execute(&symbols_sql, [&file_path])?;
+        tx.execute(&imports_sql, [&file_path])?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn search_decisions(&self, keywords: &[String]) -> Result<Vec<(String, String, String)>> {
+        let conn = self.lock();
         if keywords.is_empty() {
             return Ok(Vec::new());
         }
@@ -711,7 +862,7 @@ impl Db {
             conditions.join(" OR ")
         );
 
-        let mut stmt = self.conn.prepare(&query)?;
+        let mut stmt = conn.prepare(&query)?;
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         for k in &pattern {
             params.push(Box::new(k.clone()));
@@ -729,6 +880,7 @@ impl Db {
     }
 
     pub fn get_forbidden_rules(&self, module_names: &[String]) -> Result<Vec<(String, String, String)>> {
+        let conn = self.lock();
         if module_names.is_empty() {
             return Ok(Vec::new());
         }
@@ -740,7 +892,7 @@ impl Db {
                         JOIN modules m ON r.module_id = m.id 
                         WHERE r.rule_type = 'forbidden' AND m.name = ?1";
             
-            let mut stmt = self.conn.prepare(query)?;
+            let mut stmt = conn.prepare(query)?;
             let rows = stmt.query_map([name.as_str()], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })?;
@@ -756,7 +908,8 @@ impl Db {
     }
 
     pub fn find_adjacent_modules(&self, module_name: &str) -> Result<Vec<String>> {
-        let layer_str: Option<String> = self.conn.query_row(
+        let conn = self.lock();
+        let layer_str: Option<String> = conn.query_row(
             "SELECT layer FROM modules WHERE name = ?1",
             [module_name],
             |row| row.get(0)
@@ -781,7 +934,7 @@ impl Db {
 
         let mut results = Vec::new();
         for lt in layer_type {
-            if let Ok(name) = self.conn.query_row(
+            if let Ok(name) = conn.query_row(
                 "SELECT name FROM modules WHERE layer = ?1",
                 [lt],
                 |row| row.get(0)
@@ -939,9 +1092,16 @@ mod tests {
     }
 
     fn pragma(db: &Db, name: &str) -> String {
-        let conn = db.conn.lock().unwrap();
-        conn.query_row(&format!("PRAGMA {}", name), [], |r| r.get::<_, String>(0))
-            .unwrap()
+        let conn = db.lock();
+        // Some pragmas answer INTEGER, some TEXT -- take the raw Value.
+        let value: rusqlite::types::Value = conn
+            .query_row(&format!("PRAGMA {}", name), [], |r| r.get(0))
+            .unwrap();
+        match value {
+            rusqlite::types::Value::Text(t) => t,
+            rusqlite::types::Value::Integer(i) => i.to_string(),
+            other => format!("{:?}", other),
+        }
     }
 
     // --- path normalization on lookup ---
@@ -1071,7 +1231,7 @@ mod tests {
         let path = dir.path().join(".archex").join("archex.db");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let db = Db::open(&path).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
@@ -1111,3 +1271,4 @@ mod tests {
         assert_send_sync::<Db>();
     }
 }
+

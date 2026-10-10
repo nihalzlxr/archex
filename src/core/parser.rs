@@ -1,4 +1,5 @@
 use crate::core::db::{Db, Import, Module, Symbol, SymbolType};
+use crate::core::paths;
 use glob::Pattern;
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -86,8 +87,6 @@ impl Parser {
 
         eprintln!("Scanning {} files...", total_entries);
 
-        let project_root_str = project_root.to_string_lossy().to_lowercase();
-
         for entry in WalkDir::new(project_root)
             .into_iter()
             .filter_entry(|e| !Self::should_skip(e))
@@ -100,13 +99,9 @@ impl Parser {
             let file_path = entry.path();
             let file_path_str = file_path.to_string_lossy();
 
-            let relative_path = if file_path_str.to_lowercase().starts_with(&project_root_str) {
-                file_path_str[project_root_str.len()..].trim_start_matches(['/', '\\'])
-            } else {
-                file_path_str.as_ref()
-            }.to_string();
-
-            let relative_path = relative_path.replace('\\', "/");
+            // Same normalizer the DB uses on lookup: writer and reader agree
+            // by construction instead of by two hand-rolled versions.
+            let relative_path = paths::normalize_in(&file_path_str, &project_root);
 
             if relative_path.is_empty() {
                 continue;

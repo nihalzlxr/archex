@@ -45,7 +45,7 @@ impl ArchexService {
     ) -> Result<CallToolResult, rmcp::Error> {
         let db_path = Path::new(DB_PATH);
         
-        let db = match Db::open(db_path) {
+        let db = match Db::shared(db_path) {
             Ok(db) => db,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(
@@ -89,7 +89,7 @@ impl ArchexService {
     ) -> Result<CallToolResult, rmcp::Error> {
         let db_path = Path::new(DB_PATH);
         
-        let db = match Db::open(db_path) {
+        let db = match Db::shared(db_path) {
             Ok(db) => db,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(
@@ -151,7 +151,7 @@ impl ArchexService {
         #[tool(aggr)] req: CreatePlanRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
         let db_path = Path::new(DB_PATH);
-        let db = match Db::open(db_path) {
+        let db = match Db::shared(db_path) {
             Ok(db) => db,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(
@@ -326,7 +326,7 @@ impl ArchexService {
         #[tool(aggr)] req: FindSimilarRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
         let db_path = Path::new(DB_PATH);
-        let db = match Db::open(db_path) {
+        let db = match Db::shared(db_path) {
             Ok(db) => db,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(
@@ -392,7 +392,7 @@ impl ArchexService {
         #[tool(aggr)] req: CheckDriftRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
         let db_path = Path::new(DB_PATH);
-        let db = match Db::open(db_path) {
+        let db = match Db::shared(db_path) {
             Ok(db) => db,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(

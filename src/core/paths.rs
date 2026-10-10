@@ -1,7 +1,77 @@
+use std::path::Path;
+
+/// Canonical form of a path as archex stores and looks it up: repo-relative,
+/// forward slashes, no `.` or `..` segments. Every path that reaches the DB --
+/// written by the scanner, read back by `get_context` from whatever string the
+/// agent happened to pass -- goes through here, so both sides agree.
+pub fn normalize_in(input: &str, root: &Path) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let unified = input.replace('\\', "/");
+    let root_slash = root.to_string_lossy().replace('\\', "/");
+    let root_slash = root_slash.trim_end_matches('/');
+
+    // An absolute path under the repo root becomes repo-relative. Anything
+    // else stays absolute: guessing a root it does not belong to would file
+    // the entry under a module that does not own it.
+    let absolute = looks_absolute(&unified);
+    let relative = if absolute && !root_slash.is_empty() {
+        unified.strip_prefix(root_slash)
+    } else {
+        None
+    };
+
+    let (stripped, made_relative) = match relative {
+        Some(rest) => (rest.trim_start_matches('/').to_string(), true),
+        None => (unified.clone(), false),
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for segment in stripped.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => match out.last().map(|s| s.as_str()) {
+                // A real segment above us: fold it away.
+                Some(last) if last != ".." => {
+                    out.pop();
+                }
+                // Nothing left to fold: keep the `..` so the path stays honest
+                // about pointing outside the repo.
+                _ => out.push("..".to_string()),
+            },
+            _ => out.push(segment.to_string()),
+        }
+    }
+
+    let joined = out.join("/");
+    if made_relative {
+        return joined;
+    }
+    if !absolute {
+        return joined;
+    }
+    if joined.is_empty() {
+        return root_slash.to_string();
+    }
+    // Still absolute: the leading separator was consumed by split('/').
+    format!("/{}", joined)
+}
+
+/// `/x` and `C:/x` are both absolute; `C:x` is a drive-relative path and is
+/// not. On Unix `Path::is_absolute` says no to `C:/x`, so match by hand.
+fn looks_absolute(path: &str) -> bool {
+    path.starts_with('/') || {
+        let bytes = path.as_bytes();
+        bytes.len() > 2 && bytes[1] == b':' && (bytes[2] == b'/' || bytes[2] == b'\\')
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn strips_dot_slash_prefix() {
@@ -86,10 +156,4 @@ mod tests {
         assert_eq!(once, twice);
     }
 
-    #[test]
-    fn normalize_uses_current_dir_as_root() {
-        let cwd = std::env::current_dir().unwrap();
-        let abs: PathBuf = cwd.join("src/a.ts");
-        assert_eq!(normalize(abs.to_str().unwrap()), "src/a.ts");
-    }
 }
