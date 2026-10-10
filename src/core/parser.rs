@@ -155,6 +155,10 @@ impl Parser {
         eprintln!("Scan complete: {} scanned, {} mapped, {} unmapped",
             files_scanned, files_mapped, files_unmapped.len());
 
+        // Persist coverage: `check` runs in CI against a fresh index and must
+        // still be able to say how much of the tree it never looked at.
+        let _ = self.db.set_scan_stats(files_scanned, files_mapped);
+
         Ok(ScanResult {
             files_scanned,
             files_mapped,

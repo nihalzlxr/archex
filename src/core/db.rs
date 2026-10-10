@@ -80,6 +80,14 @@ pub struct ModuleInfo {
     pub rules: Vec<Rule>,
 }
 
+/// One import, reduced to what a boundary rule needs to judge it.
+#[derive(Debug, Clone)]
+pub struct ImportEdge {
+    pub imported_from: String,
+    pub resolved_to: Option<String>,
+    pub line_number: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FileContext {
     pub module_name: String,
@@ -425,6 +433,81 @@ impl Db {
         }))
     }
 
+    /// The module a file belongs to, or None when it is unclassified.
+    pub fn module_of_file(&self, file_path: &str) -> Option<String> {
+        self.get_module_for_file(file_path)
+            .ok()
+            .flatten()
+            .map(|(name, _)| name)
+    }
+
+    /// Resolved edges out of one file: target plus the line to jump to.
+    pub fn imports_of_file(&self, file_path: &str) -> Result<Vec<ImportEdge>> {
+        Ok(self
+            .get_imports_by_file(file_path)?
+            .into_iter()
+            .map(|i| ImportEdge {
+                imported_from: i.imported_from,
+                resolved_to: i.resolved_to,
+                line_number: i.line_number,
+            })
+            .collect())
+    }
+
+    /// How many indexed files belong to a module. Used to tell "this layer
+    /// is empty" (probably a typo) from "these layers simply have no edges
+    /// between them" (a clean result).
+    pub fn files_in_module(&self, module_name: &str) -> Result<usize> {
+        let Some(id) = self.get_module_id_by_name(module_name)? else {
+            return Ok(0);
+        };
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM file_map WHERE module_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Scanned-but-unmapped files are invisible in file_map by construction,
+    /// so the scan records the counters where `check` can see them. A file in
+    /// no module is not "clean", it is uncovered, and the output says so.
+    pub fn set_scan_stats(&self, scanned: usize, mapped: usize) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('files_scanned', ?1)",
+            [scanned.to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('files_mapped', ?1)",
+            [mapped.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn scan_stats(&self) -> (usize, usize) {
+        let conn = self.lock();
+        let read = |key: &str| -> usize {
+            conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+        };
+        (read("files_scanned"), read("files_mapped"))
+    }
+
+    /// Modules come from the committed config when it exists, so seeding
+    /// output can be replaced outright -- otherwise a module could never be
+    /// deleted.
+    pub fn clear_modules(&self) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM modules", [])?;
+        Ok(())
+    }
+
     pub fn get_module_for_file(&self, file_path: &str) -> Result<Option<(String, i64)>> {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
@@ -739,9 +822,6 @@ impl Db {
         Ok(())
     }
 
-    /// Per-file symbol lookup: the substrate the Step 2 boundary engine reads.
-    /// No caller in the binary yet -- only the path-normalization tests.
-    #[allow(dead_code)]
     pub fn get_symbols_by_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
@@ -801,8 +881,6 @@ impl Db {
         Ok(results)
     }
 
-    /// Per-file import lookup: same substrate as `get_symbols_by_file`.
-    #[allow(dead_code)]
     pub fn get_imports_by_file(&self, file_path: &str) -> Result<Vec<Import>> {
         let conn = self.lock();
         let file_path = self.normalize(file_path);

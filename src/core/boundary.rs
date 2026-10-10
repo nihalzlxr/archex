@@ -9,6 +9,273 @@
 //! - flag a file matching the config's test_globs, unless the rule opts in
 //! - flag a target matched by `allow_to`
 
+
+use crate::core::config::{Config, ConfigError, Rule, Severity};
+use crate::core::db::Db;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Replace the index's modules with the config's.
+///
+/// A committed config is authoritative: it does not merge with what a scan
+/// inferred, because merging makes a module impossible to delete.
+pub fn install_modules(db: &Db, config: &Config) -> Result<usize, ConfigError> {
+    db.clear_modules()?;
+    for module in &config.modules {
+        db.insert_module(&module.name, &module.layer, &module.path)
+            .map_err(|e| ConfigError(format!("cannot install module `{}`: {}", module.name, e)))?;
+    }
+    Ok(config.modules.len())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub rule_id: String,
+    pub severity: Severity,
+    pub from_file: String,
+    pub to_file: String,
+    pub line_number: i64,
+    pub message: String,
+}
+
+/// What a rule actually saw. A rule matching nothing and a rule that does not
+/// exist look identical from the outside; this is how they are told apart.
+#[derive(Debug, Clone, Copy)]
+pub struct RuleStatus {
+    pub from_files: usize,
+    pub to_files: usize,
+    /// Edges between the two sides, before allow_to and test exemptions.
+    pub edges: usize,
+    /// One side has no files: almost certainly a typo or a dead layer.
+    pub suspicious: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct Coverage {
+    pub classified_files: usize,
+    pub unclassified_files: usize,
+    pub unresolved_imports: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct BoundaryReport {
+    pub findings: Vec<Finding>,
+    pub rule_status: BTreeMap<String, RuleStatus>,
+    /// Files that belong to no module. Counted, never silently "clean".
+    pub classified_files: usize,
+    pub unclassified_files: usize,
+    /// Imports whose specifier did not resolve. Unclassified, never a
+    /// violation.
+    pub unresolved_imports: usize,
+}
+
+impl BoundaryReport {
+    pub fn rule_status(&self, rule_id: &str) -> Option<RuleStatus> {
+        self.rule_status.get(rule_id).copied()
+    }
+}
+
+/// One resolved edge, with everything the rules need to judge it.
+struct Edge {
+    from_file: String,
+    to_file: String,
+    line_number: i64,
+    from_module: String,
+    to_module: String,
+}
+
+pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport, ConfigError> {
+    let layer_of: BTreeMap<String, String> = config
+        .modules
+        .iter()
+        .map(|m| (m.name.clone(), m.layer.clone()))
+        .collect();
+
+    let (edges, coverage) = collect_edges(db)?;
+    for e in &edges { eprintln!("EDGE {}:{} -> {} ({} -> {})", e.from_file, e.line_number, e.to_file, e.from_module, e.to_module); }
+    let test_globs = config.test_globs().iter().map(|g| g.to_string()).collect::<Vec<_>>();
+
+    let mut report = BoundaryReport {
+        classified_files: coverage.classified_files,
+        unclassified_files: coverage.unclassified_files,
+        unresolved_imports: coverage.unresolved_imports,
+        ..Default::default()
+    };
+
+    for rule in rules {
+        if !rule.is_active() {
+            continue;
+        }
+        let Some(boundary) = &rule.boundary else {
+            continue;
+        };
+
+        let from_modules = resolve_side(&layer_of, &config.modules, &boundary.from_layer)
+            .map_err(|e| ConfigError(format!("rule `{}`: {}", rule.id, e)))?;
+        let to_modules = resolve_side(&layer_of, &config.modules, &boundary.to_layer)
+            .map_err(|e| ConfigError(format!("rule `{}`: {}", rule.id, e)))?;
+
+        let from_files: usize = from_modules
+            .iter()
+            .map(|module| db.files_in_module(module).unwrap_or(0))
+            .sum();
+        let to_files: usize = to_modules
+            .iter()
+            .map(|module| db.files_in_module(module).unwrap_or(0))
+            .sum();
+
+        let candidates: Vec<&Edge> = edges
+            .iter()
+            .filter(|e| from_modules.contains(&e.from_module) && to_modules.contains(&e.to_module))
+            .collect();
+
+        report.rule_status.insert(
+            rule.id.clone(),
+            RuleStatus {
+                from_files,
+                to_files,
+                edges: candidates.len(),
+                suspicious: from_files == 0 || to_files == 0,
+            },
+        );
+
+        for edge in candidates {
+            if !boundary.include_tests && is_test_file(&edge.from_file, &test_globs) {
+                continue;
+            }
+            if matches_any(&edge.from_file, &boundary.exclude)
+                || matches_any(&edge.to_file, &boundary.exclude)
+            {
+                continue;
+            }
+            if matches_any(&edge.to_file, &boundary.allow_to) {
+                continue;
+            }
+            report.findings.push(Finding {
+                rule_id: rule.id.clone(),
+                severity: rule.severity,
+                from_file: edge.from_file.clone(),
+                to_file: edge.to_file.clone(),
+                line_number: edge.line_number,
+                message: boundary.message.clone(),
+            });
+        }
+    }
+
+    report.findings.sort_by(|a, b| {
+        a.rule_id
+            .cmp(&b.rule_id)
+            .then(a.from_file.cmp(&b.from_file))
+            .then(a.line_number.cmp(&b.line_number))
+    });
+    Ok(report)
+}
+
+/// Pull every resolved edge out of the index, plus the coverage counters.
+///
+/// Unresolved imports and unmapped files are counted here rather than
+/// discovered later: "nobody complained" must not be mistaken for "clean".
+fn collect_edges(db: &Db) -> Result<(Vec<Edge>, Coverage), ConfigError> {
+    let indexed = db
+        .indexed_files()
+        .map_err(|e| ConfigError(format!("cannot read index: {}", e)))?;
+
+    let mut edges = Vec::new();
+    let mut coverage = Coverage::default();
+
+    // A file in no module never reaches file_map, so coverage comes from the
+    // scan's own counters. Deriving it from the index would report zero
+    // uncovered files in exactly the repos with the most of them.
+    let (scanned, mapped) = db.scan_stats();
+    coverage.classified_files = mapped;
+    coverage.unclassified_files = scanned.saturating_sub(mapped);
+
+    for file in &indexed {
+        if db.module_of_file(file).is_none() {
+            continue;
+        }
+
+        for import in db
+            .imports_of_file(file)
+            .map_err(|e| ConfigError(format!("cannot read imports: {}", e)))?
+        {
+            let Some(target) = import.resolved_to else {
+                coverage.unresolved_imports += 1;
+                continue;
+            };
+            let (Some(from_module), Some(to_module)) =
+                (db.module_of_file(file), db.module_of_file(&target))
+            else {
+                continue;
+            };
+            edges.push(Edge {
+                from_file: file.clone(),
+                to_file: target,
+                line_number: import.line_number,
+                from_module,
+                to_module,
+            });
+        }
+    }
+
+    Ok((edges, coverage))
+}
+
+/// A name is a layer or a module. If it is both, that is a config error: a
+/// coin flip here silently changes what the rule means.
+fn resolve_side(
+    layer_of: &BTreeMap<String, String>,
+    modules: &[crate::core::config::ModuleConfig],
+    name: &str,
+) -> Result<BTreeSet<String>, String> {
+    let is_layer = layer_of.values().any(|l| l == name);
+    let is_module = modules.iter().any(|m| m.name == name);
+
+    match (is_layer, is_module) {
+        (true, true) => Err(format!(
+            "`{}` is both a layer and a module name: rename one of them",
+            name
+        )),
+        (true, false) => Ok(layer_of
+            .iter()
+            .filter(|(_, layer)| *layer == name)
+            .map(|(module, _)| module.clone())
+            .collect()),
+        (false, true) => Ok([name.to_string()].into_iter().collect()),
+        (false, false) => Err(format!(
+            "`{}` is neither a declared layer nor a module",
+            name
+        )),
+    }
+}
+
+fn compile(globs: &[String]) -> Vec<glob::Pattern> {
+    globs
+        .iter()
+        .filter_map(|g| glob::Pattern::new(g).ok())
+        .collect()
+}
+
+/// `*` must not cross a `/`: `packages/content/src/*.ts` means files in that
+/// directory, not the whole tree. `**` still spans directories.
+fn matches_pattern(pattern: &glob::Pattern, path: &str) -> bool {
+    pattern.matches_path_with(
+        std::path::Path::new(path),
+        glob::MatchOptions {
+            require_literal_separator: true,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn is_test_file(path: &str, globs: &[String]) -> bool {
+    matches_any(path, globs)
+}
+
+pub fn matches_any(path: &str, globs: &[String]) -> bool {
+    let compiled = compile(globs);
+    compiled.iter().any(|p| matches_pattern(p, path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -25,12 +292,12 @@ layer = "ui"
 path = "apps/web/**"
 
 [[module]]
-name = "engine"
+name = "engine-pkg"
 layer = "engine"
 path = "packages/engine/**"
 
 [[module]]
-name = "content"
+name = "content-pkg"
 layer = "content"
 path = "packages/content/**"
 "#;
@@ -44,6 +311,28 @@ path = "packages/content/**"
     /// that scans before its sources exist measures nothing.
     fn repo(files: &[(&str, &str)]) -> Repo {
         let dir = tempfile::tempdir().expect("tempdir");
+
+        // A workspace, so `@fitness/engine` is a resolvable specifier rather
+        // than a third-party package that stays unclassified forever.
+        for sub in ["packages", "packages/engine", "packages/content"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("packages/engine/package.json"),
+            "{\"name\":\"@fitness/engine\",\"exports\":{\".\":\"./src/index.ts\"}}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("packages/content/package.json"),
+            "{\"name\":\"@fitness/content\",\"main\":\"src/index.ts\"}",
+        )
+        .unwrap();
+
         for (rel, body) in files {
             let path = dir.path().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -268,7 +557,7 @@ message = "m"
         let mut files = engine_files();
         files.push((
             "packages/content/src/repo.ts",
-            "import { schedule } from '../engine/src/internal/scheduler';\n",
+            "import { schedule } from '../../engine/src/internal/scheduler';\n",
         ));
         let repo = repo(&files);
         let rule = rule(
@@ -280,7 +569,7 @@ kind = "boundary"
 severity = "error"
 
 [boundary]
-from_layer = "content"
+from_layer = "content-pkg"
 to_layer = "engine"
 message = "m"
 "#,
@@ -297,7 +586,12 @@ message = "m"
             r#"
 schema_version = 1
 name = "t"
-layers = ["engine"]
+layers = ["ui", "engine"]
+
+[[module]]
+name = "web"
+layer = "ui"
+path = "apps/web/**"
 
 [[module]]
 name = "engine"

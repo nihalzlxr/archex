@@ -55,6 +55,12 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+impl From<rusqlite::Error> for ConfigError {
+    fn from(error: rusqlite::Error) -> Self {
+        ConfigError(error.to_string())
+    }
+}
+
 impl Config {
     pub fn test_globs(&self) -> Vec<&str> {
         match &self.test_globs {
