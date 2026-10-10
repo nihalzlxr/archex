@@ -386,11 +386,15 @@ impl ArchexService {
         )]))
     }
 
-    #[tool(description = "Check a file for architecture drift - pattern violations against module rules")]
+    #[tool(description = "Check a file for architecture violations. Same engine and same rules as the CI gate, filtered to this file -- if this says clean, CI agrees. Use it before finishing an edit.")]
     async fn check_drift(
         &self,
         #[tool(aggr)] req: CheckDriftRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
+        use crate::core::config;
+        use std::path::Path;
+
+        let root = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
         let db_path = Path::new(DB_PATH);
         let db = match Db::shared(db_path) {
             Ok(db) => db,
@@ -403,102 +407,88 @@ impl ArchexService {
             }
         };
 
-        let project_root = Path::new(".");
-        
-        let full_path = if req.file_path.starts_with('/') || req.file_path.contains(':') {
-            Path::new(&req.file_path).to_path_buf()
-        } else {
-            project_root.join(&req.file_path)
-        };
+        let rel = crate::core::paths::normalize_in(&req.file_path, &root);
+        if rel.is_empty() || crate::core::paths::looks_absolute(&rel) {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({
+                    "clean": true,
+                    "file_path": req.file_path,
+                    "note": "outside the project - no architectural context"
+                })).unwrap()
+            )]));
+        }
 
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
+        if let Err(e) = db.init_schema() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({
+                    "error": format!("cannot read the index: {}", e)
+                })).unwrap()
+            )]));
+        }
+
+        let (config, rules) = match config::Config::load(&root).and_then(|c| {
+            let rules = config::load_rules(&root)?;
+            Ok((c, rules))
+        }) {
+            Ok(pair) => pair,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string(&serde_json::json!({
-                        "error": format!("Could not read file: {}", e)
+                        "error": format!("{}", e),
+                        "hint": "Run 'archex init' to draft a committed architecture."
                     })).unwrap()
                 )]));
             }
         };
 
-        let module_info = db.get_module_for_file(&req.file_path).ok().and_then(|m| m);
-        let module_name = module_info.as_ref().map(|(n, _)| n.clone()).unwrap_or_default();
-
-        let rules = if let Some((_, module_id)) = module_info {
-            db.get_rules_for_module(module_id).unwrap_or_default()
-        } else {
-            Vec::new()
+        let report = match crate::core::boundary::check(&db, &config, &rules) {
+            Ok(report) => report,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": format!("{}", e)
+                    })).unwrap()
+                )]));
+            }
         };
 
-        let mut drift_result = crate::core::parser::Parser::check_drift(&req.file_path, &content);
-        drift_result.module = module_name.clone();
+        // Exactly what `archex check --file-path` reports: the gate's own
+        // findings, filtered to this file. An agent told "clean" here and
+        // "failed" by CI learns to ignore the tool, which costs more than a
+        // noisy one ever would.
+        let findings: Vec<&crate::core::boundary::Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.from_file == rel)
+            .collect();
 
-        for rule in &rules {
-            let rule_type_str = match rule.rule_type {
-                crate::core::db::RuleType::Forbidden => "forbidden",
-                crate::core::db::RuleType::Required => "required",
-                crate::core::db::RuleType::Warning => "warning",
-            };
+        let module = db
+            .get_module_for_file(&rel)
+            .ok()
+            .and_then(|m| m)
+            .map(|(name, _)| name)
+            .unwrap_or_default();
 
-            if let Some(pattern) = &rule.pattern {
-                let matches = crate::core::rule_engine::pattern_matches(&content, pattern);
-
-                match rule.rule_type {
-                    crate::core::db::RuleType::Forbidden if matches => {
-                        drift_result.violations.push(
-                            crate::core::parser::DriftViolation {
-                                rule_type: rule_type_str.to_string(),
-                                rule_description: rule.description.clone(),
-                                pattern: Some(pattern.clone()),
-                                line_number: None,
-                                suggestion: "Remove or refactor matching pattern".to_string(),
-                            }
-                        );
-                    }
-                    crate::core::db::RuleType::Required if !matches => {
-                        drift_result.violations.push(
-                            crate::core::parser::DriftViolation {
-                                rule_type: rule_type_str.to_string(),
-                                rule_description: rule.description.clone(),
-                                pattern: Some(pattern.clone()),
-                                line_number: None,
-                                suggestion: format!("Add required pattern: {}", pattern),
-                            }
-                        );
-                    }
-                    crate::core::db::RuleType::Warning if matches => {
-                        drift_result.violations.push(
-                            crate::core::parser::DriftViolation {
-                                rule_type: rule_type_str.to_string(),
-                                rule_description: rule.description.clone(),
-                                pattern: Some(pattern.clone()),
-                                line_number: None,
-                                suggestion: "Consider refactoring".to_string(),
-                            }
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // `clean` is derived — recompute after the rules loop pushed violations.
-        drift_result.recompute_clean();
+        let errors = findings
+            .iter()
+            .filter(|f| f.severity == config::Severity::Error)
+            .count();
 
         let result_json = serde_json::json!({
-            "file_path": drift_result.file_path,
-            "module": drift_result.module,
-            "violations": drift_result.violations.iter().map(|v| {
-                serde_json::json!({
-                    "rule_type": v.rule_type,
-                    "rule_description": v.rule_description,
-                    "pattern": v.pattern,
-                    "line_number": v.line_number,
-                    "suggestion": v.suggestion
-                })
-            }).collect::<Vec<_>>(),
-            "clean": drift_result.clean
+            "file_path": rel,
+            "module": module,
+            "clean": errors == 0,
+            "violations": findings.iter().map(|f| serde_json::json!({
+                "rule_id": f.rule_id,
+                "severity": match f.severity {
+                    config::Severity::Error => "error",
+                    config::Severity::Warning => "warning",
+                },
+                "line_number": f.line_number,
+                "imported_from": f.imported_from,
+                "to_file": f.to_file,
+                "message": f.message,
+            })).collect::<Vec<_>>(),
         });
 
         Ok(CallToolResult::success(vec![Content::text(
