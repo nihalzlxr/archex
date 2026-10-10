@@ -9,6 +9,177 @@
 //! violation, and re-recording it every week trains people to ignore the
 //! file.
 
+use crate::core::boundary::Finding;
+use crate::core::config::ConfigError;
+use serde::{Deserialize, Serialize};
+
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+
+/// Recorded debt. Committed, because CI is stateless.
+#[derive(Debug, Default, Clone)]
+pub struct Baseline {
+    pub violations: Vec<Entry>,
+}
+
+/// One recorded violation. Boundary entries name both files and carry no
+/// line number; pattern entries name a file and a count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Entry {
+    pub rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BaselineFile {
+    schema_version: i64,
+    #[serde(default)]
+    violation: Vec<Entry>,
+}
+
+impl Baseline {
+    pub fn parse_str(body: &str) -> Result<Self, ConfigError> {
+        let file: BaselineFile =
+            toml::from_str(body).map_err(|e| ConfigError(format!("invalid baseline.toml: {}", e)))?;
+
+        if file.schema_version != SUPPORTED_SCHEMA_VERSION {
+            return Err(ConfigError(format!(
+                "baseline.toml schema_version {} is not supported (this build understands {})",
+                file.schema_version, SUPPORTED_SCHEMA_VERSION
+            )));
+        }
+
+        let mut violations: Vec<Entry> = Vec::new();
+        for entry in file.violation {
+            entry.validate()?;
+            if !violations.contains(&entry) {
+                violations.push(entry);
+            }
+        }
+        Ok(Self { violations })
+    }
+
+    /// A repo with no baseline yet has no recorded debt. That is not an
+    /// error, it is the state before you record any.
+    pub fn load(root: &std::path::Path) -> Result<Self, ConfigError> {
+        let path = root.join(".archex/baseline.toml");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| ConfigError(format!("cannot read {}: {}", path.display(), e)))?;
+        Self::parse_str(&body).map_err(|e| ConfigError(format!("{}: {}", path.display(), e)))
+    }
+
+    pub fn path(root: &std::path::Path) -> std::path::PathBuf {
+        root.join(".archex/baseline.toml")
+    }
+
+    pub fn from_findings(findings: &[Finding]) -> Self {
+        let mut violations: Vec<Entry> = findings
+            .iter()
+            .map(|f| Entry {
+                rule: f.rule_id.clone(),
+                from_file: Some(f.from_file.clone()),
+                to_file: Some(f.to_file.clone()),
+                file: None,
+                count: None,
+            })
+            .collect();
+        violations.sort_by(|a, b| {
+            a.rule
+                .cmp(&b.rule)
+                .then(a.from_file.cmp(&b.from_file))
+                .then(a.to_file.cmp(&b.to_file))
+        });
+        violations.dedup();
+        Self { violations }
+    }
+
+    /// Line numbers are deliberately absent from the key. The same edge at a
+    /// different line is the same violation, and re-recording it every week
+    /// teaches people to ignore the file.
+    pub fn absorbs(&self, finding: &Finding) -> bool {
+        self.violations.iter().any(|entry| {
+            entry.rule == finding.rule_id
+                && entry.from_file.as_deref() == Some(finding.from_file.as_str())
+                && entry.to_file.as_deref() == Some(finding.to_file.as_str())
+        })
+    }
+
+    /// A pattern violation goes away when the count drops and comes back when
+    /// it rises, so the count is compared, not just the file. The pattern
+    /// engine is the next slice; count entries already parse and validate.
+    #[allow(dead_code)]
+    pub fn absorbs_count(&self, rule: &str, file: &str, count: i64) -> bool {
+        self.violations
+            .iter()
+            .find(|entry| entry.rule == rule && entry.file.as_deref() == Some(file))
+            .and_then(|entry| entry.count)
+            .map(|recorded| count <= recorded)
+            .unwrap_or(false)
+    }
+
+    pub fn to_toml(&self) -> String {
+        let file = BaselineFile {
+            schema_version: SUPPORTED_SCHEMA_VERSION,
+            violation: self.violations.clone(),
+        };
+        toml::to_string_pretty(&file).expect("baseline serializes")
+    }
+}
+
+impl Entry {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let is_boundary = self.from_file.is_some() || self.to_file.is_some();
+        let is_count = self.file.is_some() || self.count.is_some();
+
+        if is_boundary && is_count {
+            return Err(ConfigError(format!(
+                "baseline entry for `{}` mixes boundary and count fields",
+                self.rule
+            )));
+        }
+        if is_boundary {
+            let missing = if self.from_file.is_none() {
+                "from_file"
+            } else if self.to_file.is_none() {
+                "to_file"
+            } else {
+                return Ok(());
+            };
+            return Err(ConfigError(format!(
+                "baseline entry for `{}` is missing `{}`",
+                self.rule, missing
+            )));
+        }
+        if is_count {
+            let missing = if self.file.is_none() {
+                "file"
+            } else if self.count.is_none() {
+                "count"
+            } else {
+                return Ok(());
+            };
+            return Err(ConfigError(format!(
+                "baseline entry for `{}` is missing `{}`",
+                self.rule, missing
+            )));
+        }
+        Err(ConfigError(format!(
+            "baseline entry for `{}` has neither files nor a count: it records nothing",
+            self.rule
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

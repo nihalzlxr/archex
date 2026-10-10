@@ -128,7 +128,8 @@ pub fn run(file_path: String) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// `archex check --file-path` is a per-file convenience for an agent mid-edit.
 /// The gate is the promise, and it runs over the whole tree.
-pub fn run_gate(strict: bool) -> Result<bool, Box<dyn std::error::Error>> {
+pub fn run_gate(strict: bool, update_baseline: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    use crate::core::baseline::Baseline;
     use crate::core::boundary;
     use crate::core::config::{self, Config};
 
@@ -192,11 +193,45 @@ pub fn run_gate(strict: bool) -> Result<bool, Box<dyn std::error::Error>> {
         eprintln!("{}", line);
     }
 
-    if report.findings.is_empty() {
-        println!("\n  No violations.");
+    if update_baseline {
+        let baseline = Baseline::from_findings(&report.findings);
+        let path = Baseline::path(&root);
+        std::fs::write(&path, baseline.to_toml())?;
+        println!(
+            "\n  Recorded {} existing violation(s) in {}. Commit it.",
+            baseline.violations.len(),
+            path.display()
+        );
+        return Ok(true);
+    }
+
+    // Recorded debt is reported, not hidden: it is still a violation, it just
+    // does not fail the build. Silently dropping it would make the baseline a
+    // place violations go to die.
+    let baseline = Baseline::load(&root)?;
+    let mut fresh = Vec::new();
+    let mut recorded = 0usize;
+    for finding in &report.findings {
+        if baseline.absorbs(finding) {
+            recorded += 1;
+        } else {
+            fresh.push(finding);
+        }
+    }
+
+    if fresh.is_empty() {
+        if recorded > 0 {
+            println!("\n  No NEW violations ({} recorded in baseline).", recorded);
+        } else {
+            println!("\n  No violations.");
+        }
     } else {
-        println!("\n  {} violation(s):", report.findings.len());
-        for finding in &report.findings {
+        if recorded > 0 {
+            println!("\n  {} new violation(s):", fresh.len());
+        } else {
+            println!("\n  {} violation(s):", fresh.len());
+        }
+        for finding in &fresh {
             println!(
                 "    {}:{}  [{}] {}",
                 finding.from_file, finding.line_number, finding.rule_id, finding.message
@@ -208,8 +243,7 @@ pub fn run_gate(strict: bool) -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
 
-    let errors = report
-        .findings
+    let errors = fresh
         .iter()
         .filter(|f| f.severity == crate::core::config::Severity::Error)
         .count();

@@ -26,6 +26,9 @@ enum Commands {
         /// Fail on rules that match nothing, not just on violations.
         #[arg(long)]
         strict: bool,
+        /// Record current violations as the baseline instead of failing.
+        #[arg(long)]
+        update_baseline: bool,
     },
     Rule {
         #[command(subcommand)]
@@ -55,14 +58,14 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Check { file_path, strict } => match file_path {
+        Commands::Check { file_path, strict, update_baseline } => match file_path {
             Some(path) => {
                 if let Err(e) = cli::check::run(path) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             }
-            None => match cli::check::run_gate(strict) {
+            None => match cli::check::run_gate(strict, update_baseline) {
                 Ok(true) => {}
                 Ok(false) => std::process::exit(1),
                 Err(e) => {
