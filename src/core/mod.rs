@@ -6,3 +6,4 @@ pub mod mcp;pub mod paths;
 #[cfg(test)]
 mod eval;
 pub mod resolve;
+pub mod config;
