@@ -8,6 +8,21 @@ use crate::core::paths;
 
 pub const DB_PATH: &str = ".archex/archex.db";
 
+/// Bump when the shape of the index changes. On mismatch the cache is dropped
+/// and rebuilt from code -- it is derived, never the source of truth, so a
+/// migration would be code that only ever runs once, on machines nobody has.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Every table the index owns. Dropped wholesale on a version mismatch.
+const OWNED_TABLES: &[&str] = &[
+    "symbols",
+    "imports",
+    "file_map",
+    "rules",
+    "modules",
+    "decisions",
+];
+
 /// One SQLite connection per DB file, behind a mutex. WAL lets readers run
 /// while a writer holds the write lock, so a single shared connection is both
 /// faster and safer than the five the MCP server used to open per process.
@@ -161,6 +176,7 @@ impl Db {
 
     pub fn init_schema(&self) -> Result<()> {
         let conn = self.lock();
+        self.rebuild_if_stale(&conn)?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS modules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,6 +226,40 @@ impl Db {
         Ok(())
     }
 
+    /// Drop everything if the on-disk version is not ours. A fresh database
+    /// has no meta table at all, which is not a mismatch -- there is nothing
+    /// to drop.
+    fn rebuild_if_stale(&self, conn: &Connection) -> Result<()> {
+        let recorded: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let stale = match recorded {
+            None => false,
+            Some(value) => value.parse::<i64>().ok() != Some(SCHEMA_VERSION),
+        };
+
+        if stale {
+            for table in OWNED_TABLES {
+                conn.execute(&format!("DROP TABLE IF EXISTS {}", table), [])?;
+            }
+        }
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn create_symbols_table(conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS symbols (
@@ -251,6 +301,7 @@ impl Db {
                 imported_names TEXT NOT NULL,
                 module_id INTEGER NOT NULL,
                 resolved_to TEXT,
+                line_number INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(module_id) REFERENCES modules(id)
             )",
             [],
@@ -680,8 +731,8 @@ impl Db {
         for import in imports {
             let names_json = serde_json::to_string(&import.imported_names).unwrap_or_else(|_| "[]".to_string());
             tx.execute(
-                "INSERT INTO imports (file_path, imported_from, imported_names, module_id, resolved_to) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (import.file_path.as_str(), import.imported_from.as_str(), names_json.as_str(), import.module_id, import.resolved_to.as_deref()),
+                "INSERT INTO imports (file_path, imported_from, imported_names, module_id, resolved_to, line_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (import.file_path.as_str(), import.imported_from.as_str(), names_json.as_str(), import.module_id, import.resolved_to.as_deref(), import.line_number),
             )?;
         }
         tx.commit()?;
@@ -756,7 +807,7 @@ impl Db {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, file_path, imported_from, imported_names, module_id, resolved_to FROM imports WHERE {}",
+            "SELECT id, file_path, imported_from, imported_names, module_id, resolved_to, line_number FROM imports WHERE {}",
             Self::path_match("file_path")
         ))?;
         let imports = stmt.query_map([&file_path], |row| {
@@ -769,6 +820,7 @@ impl Db {
                 imported_names,
                 module_id: row.get(4)?,
                 resolved_to: row.get(5)?,
+                line_number: row.get(6)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -944,6 +996,9 @@ pub struct Import {
     /// Repo-relative target when the specifier resolved, `None` when it did
     /// not. `None` means UNCLASSIFIED -- it is never a violation.
     pub resolved_to: Option<String>,
+    /// 1-based line of the import statement. A violation with a file and no
+    /// line is a finding nobody can act on.
+    pub line_number: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -998,6 +1053,7 @@ mod tests {
             imported_names: vec!["db".to_string()],
             module_id,
             resolved_to: None,
+            line_number: 1,
         }])
         .expect("insert imports");
         db
@@ -1201,3 +1257,99 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use std::fs;
+
+    /// The DB is a derived cache, never the source of truth, so a schema
+    /// change drops and rebuilds instead of writing a migration. A migration
+    /// would be code that only ever runs once, on machines nobody has.
+    #[test]
+    fn schema_version_mismatch_rebuilds_instead_of_migrating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archex.db");
+
+        // A database written by an older archex.
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE modules (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO modules (id, name) VALUES (1, 'legacy');
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        db.init_schema().unwrap();
+
+        let legacy: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM modules WHERE name = 'legacy'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(legacy, 0, "a stale schema must be dropped, not migrated");
+
+        // And the rebuilt DB is actually usable.
+        db.insert_module("web", "ui", "apps/web/**").unwrap();
+        assert_eq!(db.get_all_modules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn matching_schema_version_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archex.db");
+
+        let db = Db::open(&path).unwrap();
+        db.init_schema().unwrap();
+        db.insert_module("web", "ui", "apps/web/**").unwrap();
+        db.init_schema().unwrap();
+
+        assert_eq!(
+            db.get_all_modules().unwrap().len(),
+            1,
+            "re-running init_schema must never drop a current database"
+        );
+    }
+
+    #[test]
+    fn schema_version_is_recorded() {
+        let db = Db::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let conn = db.lock();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn a_corrupt_version_is_treated_as_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archex.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE modules (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO modules (id, name) VALUES (1, 'legacy');
+                 INSERT INTO meta (key, value) VALUES ('schema_version', 'garbage');",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        db.init_schema().unwrap();
+        assert_eq!(db.get_all_modules().unwrap().len(), 0);
+    }
+}

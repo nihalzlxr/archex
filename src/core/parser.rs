@@ -362,7 +362,7 @@ impl Parser {
             "import_statement" => {
                 let imported_from = Self::extract_ts_import_path(node, content);
                 let names = Self::extract_ts_imported_names(node, content);
-                
+
                 if !imported_from.is_empty() || !names.is_empty() {
                     imports.push(Import {
                         id: 0,
@@ -371,6 +371,38 @@ impl Parser {
                         imported_names: names,
                         module_id,
                         resolved_to: None,
+                        line_number: node.start_position().row as i64 + 1,
+                    });
+                }
+            }
+            // `export { x } from './a'` and `export * from './b'` are edges.
+            "export_statement" => {
+                if let Some(source) = node.child_by_field_name("source") {
+                    let imported_from = Self::string_literal_value(&source, content);
+                    if !imported_from.is_empty() {
+                        imports.push(Import {
+                            id: 0,
+                            file_path: file_path.to_string(),
+                            imported_from,
+                            imported_names: Vec::new(),
+                            module_id,
+                            resolved_to: None,
+                            line_number: node.start_position().row as i64 + 1,
+                        });
+                    }
+                }
+            }
+            // require('./x') and await import('./x') are edges too.
+            "call_expression" => {
+                if let Some(specifier) = Self::require_or_dynamic_import(node, content) {
+                    imports.push(Import {
+                        id: 0,
+                        file_path: file_path.to_string(),
+                        imported_from: specifier,
+                        imported_names: Vec::new(),
+                        module_id,
+                        resolved_to: None,
+                        line_number: node.start_position().row as i64 + 1,
                     });
                 }
             }
@@ -387,20 +419,47 @@ impl Parser {
     /// The specifier of an import statement. TypeScript accepts single and
     /// double quotes and both appear in real repos; accepting only one drops
     /// every import written the other way, silently.
+    /// The specifier of `require('x')` / `import('x')`, or None for any
+    /// other call.
+    fn require_or_dynamic_import(node: &tree_sitter::Node, content: &str) -> Option<String> {
+        let function = node.child_by_field_name("function")?;
+        let name = Self::get_node_text(&function, content);
+        if name != "require" && name != "import" {
+            return None;
+        }
+        let args = node.child_by_field_name("arguments")?;
+        let first = args.named_child(0)?;
+        let specifier = Self::string_literal_value(&first, content);
+        if specifier.is_empty() {
+            None
+        } else {
+            Some(specifier)
+        }
+    }
+
+    /// Unquote a string node. TypeScript accepts single, double and backtick
+    /// quotes; accepting only one silently drops imports written the other
+    /// way.
+    fn string_literal_value(node: &tree_sitter::Node, content: &str) -> String {
+        if node.kind() != "string" {
+            return String::new();
+        }
+        let text = node.utf8_text(content.as_bytes()).unwrap_or_default();
+        let quote = match text.chars().next() {
+            Some(q @ ('"' | '\'' | '`')) => q,
+            _ => return String::new(),
+        };
+        let inner = text.trim_start_matches(quote);
+        inner.strip_suffix(quote).unwrap_or(inner).replace("\\'", "'")
+    }
+
     fn extract_ts_import_path(node: &tree_sitter::Node, content: &str) -> String {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                if child.kind() != "string" {
-                    continue;
+                let value = Self::string_literal_value(&child, content);
+                if !value.is_empty() {
+                    return value;
                 }
-                let text = child.utf8_text(content.as_bytes()).unwrap_or_default();
-                let quote = match text.chars().next() {
-                    Some(q @ ('"' | '\'' | '`')) => q,
-                    _ => continue,
-                };
-                let inner = text.trim_start_matches(quote);
-                let inner = inner.strip_suffix(quote).unwrap_or(inner);
-                return inner.replace("\\'", "'").replace("\\\\", "\\");
             }
         }
         String::new()
@@ -587,6 +646,7 @@ if kind == "default_import" {
                 imported_names,
                 module_id: 0,
                         resolved_to: None,
+                line_number: node.start_position().row as i64 + 1,
             })
         } else {
             None
@@ -707,6 +767,7 @@ if kind == "default_import" {
                 imported_names,
                 module_id: 0,
                 resolved_to: None,
+                line_number: node.start_position().row as i64 + 1,
             })
         } else {
             None
