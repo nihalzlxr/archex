@@ -302,3 +302,214 @@ path = "packages/engine/**"
         assert!(err.to_string().contains("path"), "{}", err);
     }
 }
+
+/// `rules/<id>.toml` — one rule per file.
+///
+/// Three engines, one schema, `kind` selects. The invariant that matters:
+/// `kind` must match exactly one engine table. A rule with two tables, or
+/// none, is not "mostly fine" — it is a rule nobody knows what it checks.
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    fn parse(body: &str) -> Result<Rule, ConfigError> {
+        Rule::parse_str(body)
+    }
+
+    const BOUNDARY: &str = r#"
+schema_version = 1
+id = "web-uses-engine-entry"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "web"
+to_layer = "engine"
+allow_to = ["packages/engine/src/index.ts"]
+message = "Import the engine through its public entrypoint."
+"#;
+
+    #[test]
+    fn parses_a_boundary_rule() {
+        let rule = parse(BOUNDARY).expect("valid rule");
+        assert_eq!(rule.id, "web-uses-engine-entry");
+        assert_eq!(rule.severity, Severity::Error);
+        let boundary = rule.boundary.expect("boundary table");
+        assert_eq!(boundary.from_layer, "web");
+        assert_eq!(boundary.to_layer, "engine");
+        assert_eq!(boundary.allow_to, vec!["packages/engine/src/index.ts"]);
+        assert!(!boundary.include_tests);
+    }
+
+    #[test]
+    fn include_tests_opts_back_in() {
+        let rule = parse(
+            r#"
+schema_version = 1
+id = "r"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "a"
+to_layer = "b"
+include_tests = true
+message = "m"
+"#,
+        )
+        .expect("valid");
+        assert!(rule.boundary.unwrap().include_tests);
+    }
+
+    #[test]
+    fn allow_to_defaults_to_empty() {
+        let rule = parse(
+            r#"
+schema_version = 1
+id = "r"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "a"
+to_layer = "b"
+message = "m"
+"#,
+        )
+        .expect("valid");
+        assert!(rule.boundary.unwrap().allow_to.is_empty());
+    }
+
+    #[test]
+    fn kind_boundary_with_no_boundary_table_is_rejected() {
+        let err = parse(
+            "schema_version = 1\nid = \"r\"\nstatus = \"accepted\"\nkind = \"boundary\"\nseverity = \"error\"\nmessage = \"m\"\n",
+        )
+        .expect_err("must not parse");
+        assert!(err.to_string().contains("boundary"), "{}", err);
+    }
+
+    #[test]
+    fn two_engine_tables_are_rejected() {
+        let err = parse(
+            r#"
+schema_version = 1
+id = "r"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "a"
+to_layer = "b"
+message = "m"
+
+[pattern]
+pattern = "x"
+"#,
+        )
+        .expect_err("must not parse");
+        assert!(err.to_string().contains("exactly one"), "{}", err);
+    }
+
+    /// The exact failure the plan warns about: a typo in `allow_to` that
+    /// silently disables the exception.
+    #[test]
+    fn typo_in_allow_to_is_rejected() {
+        let err = parse(
+            r#"
+schema_version = 1
+id = "r"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "a"
+to_layer = "b"
+allow_too = ["x"]
+message = "m"
+"#,
+        )
+        .expect_err("must not parse");
+        assert!(err.to_string().contains("allow_too"), "{}", err);
+    }
+
+    #[test]
+    fn unknown_kind_is_rejected() {
+        let err = parse(
+            "schema_version = 1\nid = \"r\"\nstatus = \"accepted\"\nkind = \"vibes\"\nseverity = \"error\"\n",
+        )
+        .expect_err("must not parse");
+        assert!(err.to_string().contains("vibes"), "{}", err);
+    }
+
+    #[test]
+    fn unknown_status_is_rejected() {
+        let err = parse(
+            "schema_version = 1\nid = \"r\"\nstatus = \"maybe\"\nkind = \"boundary\"\nseverity = \"error\"\n",
+        )
+        .expect_err("must not parse");
+        assert!(err.to_string().contains("maybe"), "{}", err);
+    }
+
+    #[test]
+    fn boundary_from_and_to_are_required() {
+        let err = parse(
+            r#"
+schema_version = 1
+id = "r"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+message = "m"
+"#,
+        )
+        .expect_err("must not parse");
+        assert!(err.to_string().contains("from_layer"), "{}", err);
+    }
+
+    #[test]
+    fn boundary_message_is_required() {
+        let err = parse(
+            r#"
+schema_version = 1
+id = "r"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "a"
+to_layer = "b"
+"#,
+        )
+        .expect_err("must not parse");
+        assert!(err.to_string().contains("message"), "{}", err);
+    }
+
+    #[test]
+    fn severity_warning_is_allowed() {
+        let rule = parse(
+            r#"
+schema_version = 1
+id = "r"
+status = "accepted"
+kind = "boundary"
+severity = "warning"
+
+[boundary]
+from_layer = "a"
+to_layer = "b"
+message = "m"
+"#,
+        )
+        .expect("valid");
+        assert_eq!(rule.severity, Severity::Warning);
+    }
+}
