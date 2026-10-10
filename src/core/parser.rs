@@ -1066,6 +1066,59 @@ mod tests {
         }
     }
 
+    // --- import line numbers: the boundary engine reports a line or nothing ---
+
+    fn imports_of(content: &str) -> Vec<(String, i64)> {
+        let imports = Parser::extract_ts_symbols("src/a.ts", 1, content, Path::new("src/a.ts")).1;
+        imports
+            .into_iter()
+            .map(|i| (i.imported_from, i.line_number))
+            .collect()
+    }
+
+    #[test]
+    fn static_import_records_its_line() {
+        let found = imports_of(
+            "import { a } from './a';\n\nimport { b } from './b';\n",
+        );
+        assert_eq!(found, vec![("./a".to_string(), 1), ("./b".to_string(), 3)]);
+    }
+
+    #[test]
+    fn side_effect_import_records_its_line() {
+        let found = imports_of("// header\nimport './polyfill';\n");
+        assert_eq!(found, vec![("./polyfill".to_string(), 2)]);
+    }
+
+    #[test]
+    fn export_from_records_its_line() {
+        let found = imports_of("const a = 1;\nexport { a } from './a';\nexport * from './b';\n");
+        assert_eq!(
+            found,
+            vec![("./a".to_string(), 2), ("./b".to_string(), 3)],
+            "re-exports are edges too"
+        );
+    }
+
+    #[test]
+    fn require_call_records_its_line() {
+        let found = imports_of("const x = require('./x');\n");
+        assert_eq!(found, vec![("./x".to_string(), 1)]);
+    }
+
+    #[test]
+    fn dynamic_import_records_its_line() {
+        let found = imports_of("async function f() {\n  const m = await import('./lazy');\n}\n");
+        assert_eq!(found, vec![("./lazy".to_string(), 2)]);
+    }
+
+    #[test]
+    fn python_import_records_its_line() {
+        let imports = Parser::extract_python_symbols("a.py", 1, "import os\nfrom x import y\n").1;
+        let lines: Vec<i64> = imports.iter().map(|i| i.line_number).collect();
+        assert_eq!(lines, vec![1, 2]);
+    }
+
     // --- signatures: TS ---
 
     #[test]
