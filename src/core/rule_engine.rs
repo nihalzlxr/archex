@@ -21,3 +21,36 @@ pub fn pattern_matches(content: &str, pattern: &str) -> bool {
         content_lower.contains(&pattern_lower)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::pattern_matches;
+
+    // The original bug: the pattern was compiled with its original case and
+    // matched against lowercased content, so any pattern containing an
+    // uppercase literal silently never fired. Guards the matching semantics
+    // for the file-based pattern engine (PLAN.md §19.1), which is where these
+    // rules are evaluated once it lands.
+    #[test]
+    fn uppercase_pattern_matches_lowercase_content() {
+        assert!(pattern_matches("  fetch('/api/user');\n", r"Fetch\("));
+    }
+
+    #[test]
+    fn lowercase_pattern_matches_lowercase_content() {
+        assert!(pattern_matches("  fetch('/api/user');\n", r"fetch\("));
+    }
+
+    #[test]
+    fn pattern_does_not_match_unrelated_content() {
+        assert!(!pattern_matches("export function Widget() {}\n", r"fetch\("));
+    }
+
+    // A pattern that is not valid regex falls back to substring containment,
+    // case-insensitively, rather than silently never matching.
+    #[test]
+    fn invalid_regex_falls_back_to_case_insensitive_substring() {
+        assert!(pattern_matches("import { z } from 'zod';\n", "from 'zod'"));
+        assert!(!pattern_matches("import { y } from 'yup';\n", "from 'zod'"));
+    }
+}

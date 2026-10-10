@@ -711,5 +711,25 @@ pub fn load_rules(root: &std::path::Path) -> Result<Vec<Rule>, ConfigError> {
             .unwrap_or(rule.id);
         rules.push(rule);
     }
+
+    // A rule whose engine does not exist yet must say so. `boundary::check`
+    // skips anything without a `[boundary]` table, and a rule that is loaded,
+    // valid, and never evaluated is indistinguishable from one that does not
+    // exist — the "no rule may match nothing silently" failure, in the one
+    // place where it is still true.
+    for rule in &rules {
+        if !rule.is_active() {
+            continue;
+        }
+        if rule.boundary.is_none() {
+            eprintln!(
+                "warning: rule `{}` is a {} rule and is NOT enforced yet — \
+                 only boundary rules are evaluated today",
+                rule.id,
+                rule.kind.table_name()
+            );
+        }
+    }
+
     Ok(rules)
 }

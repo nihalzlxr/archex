@@ -1,128 +1,91 @@
 use crate::core::db::{Db, DB_PATH};
-use crate::core::parser::{Parser, DriftViolation};
 use std::path::Path;
-use crate::core::db::RuleType;
 
+/// The per-file advisory: an agent mid-edit asks "is this file clean?"
+///
+/// This runs the SAME loader and the SAME engine as the gate, then filters the
+/// report to one file. Not "similar to" the gate — the same findings, so an
+/// agent can never be told a file is clean while CI blocks it. Advisory and
+/// gate disagreement is worse than either being wrong alone: agents learn to
+/// distrust the advisory and stop asking.
 pub fn run(file_path: String) -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::open(Path::new(DB_PATH))?;
+    use crate::core::config;
 
-    let full_path = if file_path.starts_with('/') || file_path.contains(':') {
-        Path::new(&file_path).to_path_buf()
-    } else {
-        std::env::current_dir()?.join(&file_path)
-    };
+    let root = std::env::current_dir()?;
+    let db = Db::shared(Path::new(DB_PATH))?;
 
-    let content = std::fs::read_to_string(&full_path)?;
-    
-    let module_info = db.get_module_for_file(&file_path).ok().and_then(|m| m);
-    let module_name = module_info.as_ref().map(|(n, _)| n.clone()).unwrap_or_else(|| "unknown".to_string());
-
-    let rules = if let Some((_, module_id)) = module_info {
-        db.get_rules_for_module(module_id).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let mut drift_result = Parser::check_drift(&file_path, &content);
-    drift_result.module = module_name.clone();
-
-    for rule in &rules {
-        let rule_type_str = match rule.rule_type {
-            RuleType::Forbidden => "forbidden",
-            RuleType::Required => "required",
-            RuleType::Warning => "warning",
-        };
-
-        if let Some(pattern) = &rule.pattern {
-            let matches = crate::core::rule_engine::pattern_matches(&content, pattern);
-
-            match rule.rule_type {
-                RuleType::Forbidden if matches => {
-                    drift_result.violations.push(DriftViolation {
-                        rule_type: rule_type_str.to_string(),
-                        rule_description: rule.description.clone(),
-                        pattern: Some(pattern.clone()),
-                        line_number: None,
-                        suggestion: "Remove or refactor matching pattern".to_string(),
-                    });
-                }
-                RuleType::Required if !matches => {
-                    drift_result.violations.push(DriftViolation {
-                        rule_type: rule_type_str.to_string(),
-                        rule_description: rule.description.clone(),
-                        pattern: Some(pattern.clone()),
-                        line_number: None,
-                        suggestion: format!("Add required pattern: {}", pattern),
-                    });
-                }
-                RuleType::Warning if matches => {
-                    drift_result.violations.push(DriftViolation {
-                        rule_type: rule_type_str.to_string(),
-                        rule_description: rule.description.clone(),
-                        pattern: Some(pattern.clone()),
-                        line_number: None,
-                        suggestion: "Consider refactoring".to_string(),
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // `clean` is derived — recompute after the rules loop pushed violations.
-    drift_result.recompute_clean();
-
-    if drift_result.clean {
-        println!("✓ {}: Clean - no forbidden violations found", file_path);
-        for v in &drift_result.violations {
-            if v.rule_type == "warning" {
-                println!("  ⚠ {}: {}", v.rule_type, v.rule_description);
-            } else if v.rule_type == "required" {
-                println!("  ⚠ {}: {}", v.rule_type, v.rule_description);
-            }
-        }
+    // Normalize the way the index stores paths, so an agent passing an
+    // absolute path, a backslash path or `./`-prefixed path matches the same
+    // file the gate reports. A file the repo does not own is not something an
+    // architectural rule can have an opinion about.
+    let rel = crate::core::paths::normalize_in(&file_path, &root);
+    let absolute_outside = crate::core::paths::looks_absolute(&rel);
+    if rel.is_empty() || absolute_outside {
+        println!(
+            "✓ {}: outside the project — no architectural context",
+            file_path
+        );
         return Ok(());
     }
 
-    println!("✗ {}: Violations found in module '{}'", file_path, module_name);
-    println!();
-
-    for v in &drift_result.violations {
-        match v.rule_type.as_str() {
-            "forbidden" => {
-                println!("  ✗ FORBIDDEN: {}", v.rule_description);
-            }
-            "required" => {
-                println!("  ⚠ REQUIRED: {}", v.rule_description);
-            }
-            "warning" => {
-                println!("  ⚠ WARNING: {}", v.rule_description);
-            }
-            _ => {
-                println!("  - {}: {}", v.rule_type, v.rule_description);
-            }
-        }
-
-        if let Some(pattern) = &v.pattern {
-            if !pattern.is_empty() {
-                println!("    Pattern: {}", pattern);
-            }
-        }
-        if !v.suggestion.is_empty() {
-            println!("    Suggestion: {}", v.suggestion);
-        }
-        println!();
+    db.init_schema()?;
+    if db.get_all_modules()?.is_empty() {
+        return Err("no modules in the index. Run `archex init` first.".into());
     }
 
-    let has_forbidden = drift_result.violations.iter()
-        .any(|v| v.rule_type == "forbidden");
+    let config = config::Config::load(&root).map_err(|e| format!(
+        "{}\n\nThe advisory needs a committed architecture. Run `archex init` to draft one.",
+        e
+    ))?;
+    let rules = config::load_rules(&root)?;
 
-    if has_forbidden {
+    let report = crate::core::boundary::check(&db, &config, &rules)?;
+
+    // Baseline absorbs debt for the gate. The advisory answers "is this file
+    // violating?" — recorded debt is still a violation, it just does not fail
+    // the build. Hiding it here would make the two paths disagree for a
+    // different reason.
+    let findings: Vec<&crate::core::boundary::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.from_file == rel)
+        .collect();
+
+    if findings.is_empty() {
+        println!("✓ {}: Clean - no architecture violations", rel);
+        return Ok(());
+    }
+
+    println!(
+        "✗ {}: {} architecture violation(s)",
+        rel,
+        findings.len()
+    );
+    println!();
+
+    let mut errors = 0usize;
+    for finding in &findings {
+        println!(
+            "  {}:{}  [{}] {}",
+            finding.from_file, finding.line_number, finding.rule_id, finding.message
+        );
+        println!(
+            "        imports {} -> {}",
+            finding.imported_from, finding.to_file
+        );
+        match finding.severity {
+            crate::core::config::Severity::Error => errors += 1,
+            crate::core::config::Severity::Warning => {}
+        }
+    }
+
+    if errors > 0 {
         std::process::exit(1);
     }
 
     Ok(())
 }
+
 /// The gate: whole-repo, config-driven, exit code 1 on an error-severity
 /// finding.
 ///

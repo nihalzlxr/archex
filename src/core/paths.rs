@@ -62,7 +62,7 @@ pub fn normalize_in(input: &str, root: &Path) -> String {
 
 /// `/x` and `C:/x` are both absolute; `C:x` is a drive-relative path and is
 /// not. On Unix `Path::is_absolute` says no to `C:/x`, so match by hand.
-fn looks_absolute(path: &str) -> bool {
+pub fn looks_absolute(path: &str) -> bool {
     path.starts_with('/') || {
         let bytes = path.as_bytes();
         bytes.len() > 2 && bytes[1] == b':' && (bytes[2] == b'/' || bytes[2] == b'\\')
