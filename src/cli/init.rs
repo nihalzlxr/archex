@@ -358,3 +358,95 @@ pub(crate) fn detect_project_type(root: &Path) -> ProjectType {
     }
     ProjectType::Unknown
 }
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    fn workspace(root: &Path) {
+        std::fs::create_dir_all(root.join("packages/engine/src")).unwrap();
+        std::fs::create_dir_all(root.join("apps/web/app")).unwrap();
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\n  - \"apps/*\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packages/engine/package.json"),
+            "{\"name\":\"@fitness/engine\"}",
+        )
+        .unwrap();
+        std::fs::write(root.join("apps/web/package.json"), "{\"name\":\"web\"}").unwrap();
+    }
+
+    #[test]
+    fn drafts_one_module_per_workspace_package() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace(dir.path());
+        let draft = draft_config(dir.path()).expect("draft");
+        let config = Config::parse_str(&draft).expect("the draft must parse");
+
+        assert_eq!(config.modules.len(), 2);
+        let engine = config.modules.iter().find(|m| m.name == "engine").unwrap();
+        assert_eq!(engine.path, "packages/engine/**");
+        assert_eq!(config.layers.len(), 2, "one layer per module, pre-filled for editing");
+    }
+
+    /// The whole point: a human assigns layers, archex does not guess them.
+    #[test]
+    fn the_draft_leaves_layers_to_be_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace(dir.path());
+        let draft = draft_config(dir.path()).unwrap();
+        assert!(
+            draft.contains("# LAYERS AND MODULE NAMES BELOW ARE A DRAFT"),
+            "the file must say out loud that it is a draft"
+        );
+        assert!(draft.contains("test_globs"), "and carry the safe test defaults");
+    }
+
+    #[test]
+    fn an_existing_config_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace(dir.path());
+        let path = dir.path().join(".archex/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# mine\nschema_version = 1\n").unwrap();
+
+        let outcome = write_draft_config(dir.path()).expect("handled");
+        assert!(matches!(outcome, DraftOutcome::Skipped { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\nschema_version = 1\n");
+    }
+
+    #[test]
+    fn a_flat_repo_still_gets_a_valid_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.ts"), "export const a = 1;\n").unwrap();
+        let draft = draft_config(dir.path()).expect("draft");
+        let config = Config::parse_str(&draft).expect("must parse");
+        assert_eq!(config.modules.len(), 1);
+        assert_eq!(config.modules[0].path, "src/**");
+    }
+
+    #[test]
+    fn a_repo_with_nothing_in_it_still_gets_a_parseable_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = draft_config(dir.path()).expect("draft");
+        Config::parse_str(&draft).expect("an empty draft must still be valid");
+    }
+
+    #[test]
+    fn npm_workspaces_are_read_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("libs/core")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"workspaces\":[\"libs/*\"]}",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("libs/core/package.json"), "{\"name\":\"core\"}").unwrap();
+        let draft = draft_config(dir.path()).unwrap();
+        assert!(draft.contains("libs/core/**"), "{}", draft);
+    }
+}
