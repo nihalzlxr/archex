@@ -3,11 +3,12 @@ use crate::core::paths;
 use glob::Pattern;
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::sync::Arc;
 use walkdir::WalkDir;
 use serde::Serialize;
 
 pub struct Parser {
-    db: Db,
+    db: Arc<Db>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,7 +54,7 @@ pub const SKIP_DIRS: &[&str] = &["node_modules", ".next", ".git", "dist", "build
 pub const VALID_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "rs", "py"];
 
 impl Parser {
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Arc<Db>) -> Self {
         Self { db }
     }
 

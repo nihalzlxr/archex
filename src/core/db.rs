@@ -489,6 +489,17 @@ impl Db {
         Ok(rows)
     }
 
+    /// Every file this index knows about, repo-relative. The retrieval
+    /// universe: any eval or ranking must score against this same set, or it
+    /// is measuring coverage instead of ranking.
+    #[allow(dead_code)] // Step 1 eval harness
+    pub fn indexed_files(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT file_path FROM file_map ORDER BY file_path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn search_files(&self, keyword: &str) -> Result<Vec<String>> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT file_path FROM file_map WHERE file_path LIKE ?1")?;

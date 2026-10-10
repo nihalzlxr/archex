@@ -9,17 +9,17 @@ const ARCHEX_DIR: &str = ".archex";
 /// One module to seed: name, layer, path pattern. Everything downstream takes
 /// this and nothing else, so adding a source of modules later is a change to
 /// `seeding_plan` alone.
-struct ModuleSpec {
-    name: String,
-    layer: String,
-    path_pattern: String,
-    rules: Vec<RuleSpec>,
+pub(crate) struct ModuleSpec {
+    pub(crate) name: String,
+    pub(crate) layer: String,
+    pub(crate) path_pattern: String,
+    pub(crate) rules: Vec<RuleSpec>,
 }
 
-struct RuleSpec {
-    rule_type: &'static str,
-    description: &'static str,
-    pattern: Option<&'static str>,
+pub(crate) struct RuleSpec {
+    pub(crate) rule_type: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) pattern: Option<&'static str>,
 }
 
 pub fn run() {
@@ -38,7 +38,7 @@ pub fn run() {
 
     fs::create_dir_all(ARCHEX_DIR).expect("Failed to create .archex directory");
 
-    let db = Db::open(Path::new(DB_PATH)).expect("Failed to open database");
+    let db = Db::shared(Path::new(DB_PATH)).expect("Failed to open database");
     db.init_schema().expect("Failed to initialize schema");
 
     eprintln!("Detecting project type...");
@@ -52,7 +52,7 @@ pub fn run() {
     };
 
     eprintln!("Scanning files...");
-    let parser = Parser::new(db);
+    let parser = Parser::new(db.clone());
     let result = parser.scan(&project_root).expect("Failed to scan");
 
     eprintln!();
@@ -75,7 +75,7 @@ pub fn run() {
     }
 }
 
-enum ProjectType {
+pub(crate) enum ProjectType {
     NextJs,
     Rust,
     Go,
@@ -83,7 +83,7 @@ enum ProjectType {
 }
 
 impl ProjectType {
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             ProjectType::NextJs => "a Next.js manifest",
             ProjectType::Rust => "a Rust manifest",
@@ -100,7 +100,7 @@ impl ProjectType {
 /// read modules from it and stop inferring. That change lands here and in
 /// `seed_modules`; the scanner, the index and the rule engine already take a
 /// list of modules and will not care where it came from.
-fn seeding_plan(root: &Path, project_type: &ProjectType) -> Vec<ModuleSpec> {
+pub(crate) fn seeding_plan(root: &Path, project_type: &ProjectType) -> Vec<ModuleSpec> {
     match project_type {
         // `next` in the manifest guarantees the src/app route convention, so
         // the curated modules keep their real layers. It guarantees nothing
@@ -203,7 +203,7 @@ fn has_indexable_file(root: &Path, dir: &Path) -> bool {
 
 /// Insert whatever the plan says is missing. Idempotent per module and per
 /// rule, so `init` twice is a no-op.
-fn seed_modules(db: &Db, plan: &[ModuleSpec]) -> usize {
+pub(crate) fn seed_modules(db: &Db, plan: &[ModuleSpec]) -> usize {
     let mut seeded = 0;
     for spec in plan {
         let module_id = match db.get_module_id_by_name(&spec.name).ok().flatten() {
@@ -311,7 +311,7 @@ fn nextjs_plan(root: &Path) -> Vec<ModuleSpec> {
         .collect()
 }
 
-fn detect_project_type(root: &Path) -> ProjectType {
+pub(crate) fn detect_project_type(root: &Path) -> ProjectType {
     if root.join("package.json").exists() {
         if let Ok(content) = fs::read_to_string(root.join("package.json")) {
             if content.contains("\"next\"") {
