@@ -147,3 +147,100 @@ fn setup_claude(binary_path: &str) -> anyhow::Result<()> {
 
     Ok(())
 }
+#[cfg(test)]
+mod ci_tests {
+    use super::*;
+
+    fn install(dir: &Path) -> anyhow::Result<InstallOutcome> {
+        install_ci_workflow(dir, "https://github.com/example/archex.git", "v0.1.0")
+    }
+
+    #[test]
+    fn writes_a_workflow_that_actually_runs_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path()).expect("installed");
+
+        let path = dir.path().join(".github/workflows/archex.yml");
+        let body = std::fs::read_to_string(&path).expect("workflow written");
+
+        // The three things that make it a gate rather than a report.
+        assert!(body.contains("archex init"), "must build an index");
+        assert!(body.contains("archex check"), "must run the check");
+        assert!(
+            body.contains("pull_request"),
+            "must run on the PR, not only on main"
+        );
+        // The index is derived and must never be committed back.
+        assert!(
+            body.contains("archex.db"),
+            "must keep the derived cache out of git"
+        );
+    }
+
+    #[test]
+    fn the_index_is_built_ephemerally_and_stored_nowhere() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path()).expect("installed");
+        let body =
+            std::fs::read_to_string(dir.path().join(".github/workflows/archex.yml")).unwrap();
+        assert!(
+            !body.contains("actions/upload-artifact"),
+            "the gate stores nothing: no artifacts, no caches, no uploads"
+        );
+        assert!(
+            !body.contains("actions/cache"),
+            "the index is rebuilt every run; caching it would be caching a lie"
+        );
+    }
+
+    #[test]
+    fn an_existing_workflow_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".github/workflows/archex.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# mine, hand-edited\n").unwrap();
+
+        let outcome = install(dir.path()).expect("handled");
+        assert!(matches!(outcome, InstallOutcome::Skipped { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# mine, hand-edited\n",
+            "a hand-edited workflow is the user's, not ours"
+        );
+    }
+
+    #[test]
+    fn installing_twice_does_not_duplicate_or_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path()).expect("first");
+        let first = std::fs::read_to_string(dir.path().join(".github/workflows/archex.yml")).unwrap();
+        install(dir.path()).expect("second");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".github/workflows/archex.yml")).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn the_workflow_pins_the_archex_version_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path()).expect("installed");
+        let body =
+            std::fs::read_to_string(dir.path().join(".github/workflows/archex.yml")).unwrap();
+        assert!(body.contains("https://github.com/example/archex.git"), "{}", body);
+        assert!(body.contains("v0.1.0"), "a moving ref makes CI non-reproducible");
+    }
+
+    #[test]
+    fn the_gate_runs_in_strict_mode_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path()).expect("installed");
+        let body =
+            std::fs::read_to_string(dir.path().join(".github/workflows/archex.yml")).unwrap();
+        assert!(
+            body.contains("archex check --strict"),
+            "CI should refuse a rule that matches nothing; that is the failure \
+             mode nobody notices until it silently stops guarding anything"
+        );
+    }
+}
