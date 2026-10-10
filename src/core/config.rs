@@ -141,6 +141,164 @@ fn misplaced_top_level_key(value: &toml::Value) -> Option<String> {
     }
     None
 }
+
+/// One rule, one file. `kind` must match exactly one engine table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub schema_version: i64,
+    pub id: String,
+    pub status: Status,
+    pub kind: Kind,
+    pub severity: Severity,
+    #[serde(default)]
+    pub boundary: Option<BoundaryRule>,
+    #[serde(default)]
+    pub pattern: Option<PatternRule>,
+    #[serde(default)]
+    pub presence: Option<PresenceRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Accepted,
+    Proposed,
+    Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Boundary,
+    Pattern,
+    Presence,
+}
+
+impl Kind {
+    fn table_name(&self) -> &'static str {
+        match self {
+            Kind::Boundary => "boundary",
+            Kind::Pattern => "pattern",
+            Kind::Presence => "presence",
+        }
+    }
+}
+
+/// error = CI exit 1. warning = report only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryRule {
+    /// A layer name, or a module name. Resolved against declared layers
+    /// first, then module names; ambiguity is an error, never a coin flip.
+    pub from_layer: String,
+    pub to_layer: String,
+    /// Targets exempt from this rule: a package's public entrypoint is the
+    /// legitimate way in, and internals are the thing being policed.
+    #[serde(default)]
+    pub allow_to: Vec<String>,
+    /// Skip files matching the config's test_globs unless this is true.
+    #[serde(default)]
+    pub include_tests: bool,
+    /// Anything else the rule should not apply to.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatternRule {
+    pub scope: String,
+    pub mode: PatternMode,
+    pub pattern: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PatternMode {
+    Forbidden,
+    Required,
+    Warning,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceRule {
+    pub applies_to: String,
+    pub requires: String,
+    pub message: String,
+}
+
+impl Rule {
+    pub fn parse_str(body: &str) -> Result<Self, ConfigError> {
+        let value: toml::Value =
+            toml::from_str(body).map_err(|e| ConfigError(format!("invalid TOML: {}", e)))?;
+        let rule: Rule = value
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError(format!("invalid rule: {}", e)))?;
+        rule.validate()?;
+        Ok(rule)
+    }
+
+    /// A retired rule is kept for history and enforces nothing.
+    pub fn is_active(&self) -> bool {
+        self.status != Status::Retired
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.schema_version != SUPPORTED_SCHEMA_VERSION {
+            return Err(ConfigError(format!(
+                "rule `{}`: schema_version {} is not supported",
+                self.id, self.schema_version
+            )));
+        }
+
+        let present: Vec<(&str, bool)> = vec![
+            ("boundary", self.boundary.is_some()),
+            ("pattern", self.pattern.is_some()),
+            ("presence", self.presence.is_some()),
+        ];
+        let count = present.iter().filter(|(_, is_present)| *is_present).count();
+
+        if count != 1 {
+            let named: Vec<&str> = present
+                .iter()
+                .filter(|(_, is_present)| *is_present)
+                .map(|(name, _)| *name)
+                .collect();
+            return Err(ConfigError(format!(
+                "rule `{}`: kind = \"{}\" must match exactly one engine table, found {} ({})",
+                self.id,
+                self.kind.table_name(),
+                count,
+                if named.is_empty() {
+                    "none".to_string()
+                } else {
+                    named.join(", ")
+                }
+            )));
+        }
+
+        if self.kind.table_name() != present.iter().find(|(_, p)| *p).unwrap().0 {
+            return Err(ConfigError(format!(
+                "rule `{}`: kind = \"{}\" does not match its engine table",
+                self.id,
+                self.kind.table_name()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +566,10 @@ to_layer = "b"
 message = "m"
 
 [pattern]
+scope = "apps/web/**"
+mode = "forbidden"
 pattern = "x"
+message = "m"
 "#,
         )
         .expect_err("must not parse");

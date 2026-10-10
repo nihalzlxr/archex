@@ -7,3 +7,4 @@ pub mod mcp;pub mod paths;
 mod eval;
 pub mod resolve;
 pub mod config;
+pub mod boundary;
