@@ -48,9 +48,9 @@ impl DriftResult {
     }
 }
 
-const SKIP_DIRS: &[&str] = &["node_modules", ".next", ".git", "dist", "build", "target"];
+pub const SKIP_DIRS: &[&str] = &["node_modules", ".next", ".git", "dist", "build", "target"];
 
-const VALID_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "rs", "py"];
+pub const VALID_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "rs", "py"];
 
 impl Parser {
     pub fn new(db: Db) -> Self {
