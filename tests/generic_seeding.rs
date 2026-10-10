@@ -16,27 +16,6 @@ fn init(root: &std::path::Path) {
         .success();
 }
 
-/// The curated Next.js list, kept here so the test asserts against the same
-/// table the seeder uses rather than a number copied at some past moment.
-const CURATED: &[(&str, &str, &str)] = &[
-    ("app", "ui", "src/app/**"),
-    ("components", "ui", "src/components/**"),
-    ("api", "api", "src/app/api/**"),
-    ("lib", "service", "src/lib/**"),
-    ("db", "db", "src/db/**"),
-    ("actions", "service", "src/actions/**"),
-    ("services", "service", "src/services/**"),
-    ("hooks", "ui", "src/hooks/**"),
-    ("utils", "service", "src/utils/**"),
-    ("types", "types", "src/types/**"),
-    ("middleware", "api", "src/middleware/**"),
-    ("jobs", "service", "src/jobs/**"),
-    ("validations", "service", "src/validations/**"),
-    ("models", "db", "src/models/**"),
-    ("server", "api", "src/server/**"),
-    ("libs", "service", "src/libs/**"),
-];
-
 /// A plain repo — no `next` in package.json — with three code directories and
 /// one documentation-only directory.
 fn plain_repo(root: &std::path::Path) {
@@ -207,74 +186,80 @@ fn hidden_directories_are_not_seeded_as_modules() {
     assert!(!names.iter().any(|n| n.starts_with('.')));
 }
 
-/// The manifest still guarantees the route convention, so the curated modules
-/// keep their real semantic layers -- they are an overlay, not a replacement.
+/// The curated 16-module Next.js list is GONE. Ten of its sixteen entries
+/// matched zero files on LORB and it never fired on a plain Node repo at
+/// all. A hardcoded guess about one codebase's layout is not something a
+/// manifest can vouch for, so what a Next.js repo gets instead is a
+/// DRAFTED config.toml that a human owns.
 #[test]
-fn nextjs_repo_keeps_the_curated_seed() {
+fn nextjs_repo_gets_a_drafted_config_not_a_curated_guess() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     fixture_project(root);
     init(root);
 
-    let seeded = modules(root);
-    for (name, layer, pattern) in &seeded {
-        if name == "src" {
-            continue; // the generic catch-all for anything curated misses
-        }
-        let (_, curated_layer, curated_pattern) = CURATED
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .unwrap_or_else(|| panic!("{} is not a curated module", name));
-        assert_eq!(layer, *curated_layer, "{} lost its curated layer", name);
-        assert_eq!(pattern, *curated_pattern);
-    }
-
-    let components = seeded.iter().find(|(n, _, _)| n == "components").unwrap();
-    assert_eq!(components.1, "ui", "curated layers are semantic");
-    assert_eq!(components.2, "src/components/**");
-
-    assert_eq!(rule_count(root), 8, "all 4 rule-bearing modules exist here");
-}
-
-/// A curated entry whose directory holds no code is not seeded: an empty
-/// module is noise that later reads as architecture, and the rules hanging
-/// off it can never fire.
-#[test]
-fn curated_entries_without_files_are_not_seeded() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
-    fixture_project(root);
-    init(root);
+    let draft = std::fs::read_to_string(root.join(".archex/config.toml"))
+        .expect("init must draft a config for a repo that has none");
+    assert!(draft.contains("DRAFT"), "{}", draft);
 
     let names: Vec<String> = modules(root).into_iter().map(|(n, _, _)| n).collect();
-    for empty in ["db_placeholder"] {
-        assert!(!names.contains(&empty.to_string()));
-    }
-    // The fixture has no src/db/hooks/jobs/server/models/... directories.
-    for absent in ["hooks", "jobs", "middleware", "models", "server", "validations", "actions"] {
-        assert!(!names.contains(&absent.to_string()), "{} has no files here", absent);
+    // The fixture has src/components and src/db but no src/hooks, src/jobs
+    // or src/server. A module for a directory that does not exist is noise.
+    for absent in ["hooks", "jobs", "middleware", "models", "server"] {
+        assert!(
+            !names.iter().any(|n| n == absent),
+            "drafted a module for {} which has no files",
+            absent
+        );
     }
 }
 
-/// The measured reason the curated list became an overlay: on LORB the curated
-/// list alone left 77% of the repo unclassified. The overlay must leave no
-/// source file unmapped.
+/// Whatever the drafter writes becomes authoritative immediately, so the
+/// first `archex check` already reflects the repo.
 #[test]
-fn nextjs_repo_leaves_no_source_file_unmapped() {
+fn the_drafted_config_is_what_gets_indexed() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     fixture_project(root);
     init(root);
 
-    let db = Connection::open(root.join(".archex/archex.db")).unwrap();
-    let unmapped: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM file_map WHERE file_path LIKE 'src/components/Button.tsx' OR file_path LIKE 'src/app/page.tsx' OR file_path LIKE 'src/services/userService.ts'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(unmapped, 3, "curated coverage must not leave files behind");
+    let draft = std::fs::read_to_string(root.join(".archex/config.toml")).unwrap();
+    let drafted: Vec<String> = draft
+        .lines()
+        .filter_map(|l| l.strip_prefix("name = \""))
+        .map(|l| l.split('"').next().unwrap_or("").to_string())
+        .collect();
+    // The first `name` is the project name; the rest are modules.
+    let drafted: Vec<String> = drafted.into_iter().skip(1).collect();
+
+    let indexed: Vec<String> = modules(root).into_iter().map(|(n, _, _)| n).collect();
+    assert_eq!(
+        indexed.len(),
+        drafted.len(),
+        "indexed modules must be exactly the drafted ones: {:?} vs {:?}",
+        indexed,
+        drafted
+    );
+}
+
+/// A drafted module that maps nothing is noise that later reads as
+/// architecture.
+#[test]
+fn a_drafted_module_maps_at_least_one_file() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fixture_project(root);
+    init(root);
+
+    let empty: Vec<String> = modules(root)
+        .into_iter()
+        .filter(|(_, _, pattern)| {
+            let prefix = pattern.trim_end_matches("/**");
+            !root.join(prefix).exists()
+        })
+        .map(|(name, _, _)| name)
+        .collect();
+    assert!(empty.is_empty(), "drafted modules that map nothing: {:?}", empty);
 }
 
 /// Seeding is a bootstrap default, and it is idempotent like everything else.
@@ -291,16 +276,23 @@ fn init_twice_does_not_duplicate_generic_modules() {
     assert_eq!(rule_count(root), 0);
 }
 
-/// Regression guard: the plain-repo path must not disturb the Next.js path.
+/// Re-init must never overwrite a config.toml. The human owns it, and the
+/// first thing they will do is edit it.
 #[test]
-fn init_twice_keeps_nextjs_seed_stable() {
+fn init_twice_keeps_the_drafted_config_intact() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     fixture_project(root);
     init(root);
+
+    let first = std::fs::read_to_string(root.join(".archex/config.toml")).unwrap();
+    let edited = first.replace("schema_version = 1", "schema_version = 1\n# edited by a human");
+    std::fs::write(root.join(".archex/config.toml"), &edited).unwrap();
     init(root);
 
-    let names: Vec<String> = modules(root).into_iter().map(|(n, _, _)| n).collect();
-    assert_eq!(names.len(), 6, "re-init must not resurrect dropped curated entries");
-    assert_eq!(rule_count(root), 8);
+    assert_eq!(
+        std::fs::read_to_string(root.join(".archex/config.toml")).unwrap(),
+        edited,
+        "init must never overwrite a config.toml"
+    );
 }

@@ -218,7 +218,7 @@ impl Resolver {
     fn load_workspace(&mut self) {
         let globs = workspace_globs(&self.root);
         for pattern in globs {
-            for dir in expand_glob(&self.root, &pattern) {
+            for dir in expand_glob_for(&self.root, &pattern) {
                 let manifest = dir.join("package.json");
                 let Ok(body) = std::fs::read_to_string(&manifest) else {
                     continue;
@@ -412,7 +412,7 @@ fn resolve_extends(root: &Path, from: &Path, extends: &str) -> Option<PathBuf> {
     candidate.starts_with(root).then_some(candidate)
 }
 
-fn workspace_globs(root: &Path) -> Vec<String> {
+pub(crate) fn workspace_globs(root: &Path) -> Vec<String> {
     let mut globs = Vec::new();
 
     if let Ok(body) = std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
@@ -455,7 +455,7 @@ fn workspace_globs(root: &Path) -> Vec<String> {
 }
 
 /// Minimal glob: one `*` segment. Anything fancier is not worth guessing at.
-fn expand_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
+pub(crate) fn expand_glob_for(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let segments: Vec<&str> = pattern.split('/').collect();
     let Some(star) = segments.iter().position(|s| *s == "*") else {

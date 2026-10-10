@@ -4,7 +4,7 @@ use crate::core::db::{Db, DB_PATH};
 use crate::core::parser::{Parser, SKIP_DIRS, VALID_EXTENSIONS};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const ARCHEX_DIR: &str = ".archex";
 
@@ -69,16 +69,38 @@ pub fn run() {
             }
         }
         Err(_) => {
-            let plan = seeding_plan(&project_root, &project_type);
-            eprintln!(
-                "No .archex/config.toml yet: seeding {} bootstrap module(s) from {}.",
-                plan.len(),
-                project_type.label()
-            );
-            eprintln!(
-                "These are a GUESS. Write .archex/config.toml to make the                  architecture yours."
-            );
-            seed_modules(&db, &plan)
+            // Adoption path: hand the human a starting point rather than a
+            // silent guess, then immediately index what was drafted so the
+            // first `archex check` already reflects their repo.
+            match write_draft_config(&project_root) {
+                Ok(DraftOutcome::Written(path)) => {
+                    eprintln!("Drafted {}", path.display());
+                    eprintln!("Read it, edit it, commit it: it is your architecture now.");
+                }
+                Ok(DraftOutcome::Skipped { .. }) => {}
+                Err(e) => eprintln!("Could not draft a config ({}); falling back to inference.", e),
+            }
+            match Config::load(&project_root) {
+                Ok(config) => {
+                    eprintln!("Using the drafted config ({} modules).", config.modules.len());
+                    match boundary::install_modules(&db, &config) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("Failed to install modules: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(_) => {
+                    let plan = seeding_plan(&project_root, &project_type);
+                    eprintln!(
+                        "Seeding {} inferred module(s) from {}.",
+                        plan.len(),
+                        project_type.label()
+                    );
+                    seed_modules(&db, &plan)
+                }
+            }
         }
     };
 
@@ -133,17 +155,13 @@ impl ProjectType {
 /// list of modules and will not care where it came from.
 pub(crate) fn seeding_plan(root: &Path, project_type: &ProjectType) -> Vec<ModuleSpec> {
     match project_type {
-        // `next` in the manifest guarantees the src/app route convention, so
-        // the curated modules keep their real layers. It guarantees nothing
-        // about src/db or src/services: on LORB, 10 of the 16 matched zero
-        // files and left 77% of the repo unclassified. So the curated list
-        // survives as an overlay on top of the generic plan, not as a
-        // replacement for it.
-        ProjectType::NextJs => {
-            let mut plan = nextjs_plan(root);
-            plan.extend(generic_plan(root, &plan));
-            plan
-        }
+        // `next` in the manifest used to buy a curated 16-module list with
+        // real layers. It does not any more: on LORB, 10 of those 16 matched
+        // ZERO files and left 77% of the repo unclassified, and on a plain
+        // Node repo it never fired at all. A hardcoded guess about one
+        // codebase's layout is not knowledge a manifest can vouch for, so it
+        // is gone. config.toml is where those layers are named -- by a human.
+        ProjectType::NextJs => generic_plan(root, &[]),
         // No framework convention to lean on. Take the directory names as
         // they are: a module per top-level directory, layer = the name, no
         // rules. archex does not know that `lib` is a service layer, and in
@@ -272,75 +290,7 @@ pub(crate) fn seed_modules(db: &Db, plan: &[ModuleSpec]) -> usize {
     seeded
 }
 
-/// The curated list is an overlay, not the whole architecture: an entry whose
-/// directory holds no indexable file is dropped rather than seeded empty. A
-/// module that maps zero files is noise that later reads as "there is an
-/// architecture here", and the rules hanging off it can never fire.
-fn nextjs_plan(root: &Path) -> Vec<ModuleSpec> {
-    let modules: &[(&str, &str, &str)] = &[
-        ("app", "ui", "src/app/**"),
-        ("components", "ui", "src/components/**"),
-        ("api", "api", "src/app/api/**"),
-        ("lib", "service", "src/lib/**"),
-        ("db", "db", "src/db/**"),
-        ("actions", "service", "src/actions/**"),
-        ("services", "service", "src/services/**"),
-        ("hooks", "ui", "src/hooks/**"),
-        ("utils", "service", "src/utils/**"),
-        ("types", "types", "src/types/**"),
-        ("middleware", "api", "src/middleware/**"),
-        ("jobs", "service", "src/jobs/**"),
-        ("validations", "service", "src/validations/**"),
-        ("models", "db", "src/models/**"),
-        ("server", "api", "src/server/**"),
-        ("libs", "service", "src/libs/**"),
-    ];
 
-    let rules: &[(&str, &[(&str, &str, Option<&str>)])] = &[
-        ("app", &[
-            ("forbidden", "Direct database access in UI layer", Some("from.*@/db|from.*drizzle")),
-            ("forbidden", "Direct API calls without hooks, use src/hooks", Some("fetch\\(|axios\\.")),
-        ]),
-        ("components", &[
-            ("forbidden", "No direct server calls from components", Some("from.*@/server")),
-            ("warning", "Avoid business logic in components", Some("function |const .* =")),
-        ]),
-        ("api", &[
-            ("forbidden", "Direct database import in API route", Some("from.*@/db|from.*drizzle")),
-            ("forbidden", "Business logic in API route, use services layer", Some("from.*@/services")),
-            ("required", "API routes must validate input", Some("zod|yup|joi")),
-        ]),
-        ("services", &[
-            ("required", "Services must use db layer, not direct SQL", Some("from.*@/db|from.*drizzle")),
-        ]),
-    ];
-
-    modules
-        .iter()
-        // Existence is checked against the pattern's directory (src/app),
-        // not the module name (app).
-        .filter(|(_, _, pattern)| has_indexable_file(root, &root.join(pattern.trim_end_matches("/**"))))
-        .map(|(name, layer, pattern)| ModuleSpec {
-            name: name.to_string(),
-            layer: layer.to_string(),
-            path_pattern: pattern.to_string(),
-            rules: rules
-                .iter()
-                .find(|(module, _)| module == name)
-                .map(|(_, specs)| {
-                    specs
-                        .iter()
-                        .map(|(rule_type, description, pattern)| RuleSpec {
-                            rule_type,
-                            description,
-                            pattern: *pattern,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        })
-        .collect()
-}
 
 pub(crate) fn detect_project_type(root: &Path) -> ProjectType {
     if root.join("package.json").exists() {
@@ -357,6 +307,174 @@ pub(crate) fn detect_project_type(root: &Path) -> ProjectType {
         return ProjectType::Go;
     }
     ProjectType::Unknown
+}
+
+
+#[derive(Debug)]
+pub enum DraftOutcome {
+    Written(PathBuf),
+    /// A config was already there. Ours or theirs, we do not touch it.
+    Skipped { #[allow(dead_code)] path: PathBuf },
+}
+
+/// Read a draft `config.toml` from the workspace layout: one module per
+/// workspace package, one layer per module, for a human to edit.
+///
+/// This is the adoption path, and it is deliberately NOT the generic
+/// top-level inference: that produces container modules (`apps`, `packages`)
+/// on a monorepo, which are not architecture. A workspace package IS a
+/// module someone already decided on.
+pub fn draft_config(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut modules: Vec<(String, String)> = Vec::new();
+
+    for pattern in crate::core::resolve::workspace_globs(root) {
+        for dir in expand_glob_pub(root, &pattern) {
+            let manifest = dir.join("package.json");
+            let Ok(body) = fs::read_to_string(&manifest) else {
+                continue;
+            };
+            let Some(pkg) = package_name(&body) else {
+                continue;
+            };
+            let path = crate::core::paths::normalize_in(&dir.to_string_lossy(), root);
+            modules.push((short_name(&pkg, &modules), format!("{}/**", path)));
+        }
+    }
+
+    if modules.is_empty() {
+        // Not a workspace: fall back to top-level code directories, so the
+        // draft is still worth reading and editing.
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || is_skipped_dir(&entry.path()) {
+                    continue;
+                }
+                if has_indexable_file(root, &entry.path()) {
+                    let path = format!("{}/**", name);
+                    modules.push((name, path));
+                }
+            }
+        }
+    }
+
+    modules.sort();
+    modules.dedup();
+
+    let mut out = String::new();
+    out.push_str("# archex configuration
+");
+    out.push_str("#
+");
+    out.push_str("# LAYERS AND MODULE NAMES BELOW ARE A DRAFT. Read them, change
+");
+    out.push_str("# what is wrong, delete what does not exist. A layer is just a key you
+");
+    out.push_str("# chose -- archex cannot tell you that `engine` is a domain layer, so
+");
+    out.push_str("# it will not pretend to.
+");
+    out.push_str("#
+");
+    out.push_str("# Every file that belongs to no module is reported as UNCLASSIFIED by
+");
+    out.push_str("# `archex check`. Uncovered is not the same as clean.
+
+");
+    out.push_str("schema_version = 1\n");
+    out.push_str("name = \"");
+    out.push_str(
+        &root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string()),
+    );
+    out.push_str("\"\n\n");
+
+    let layers: Vec<String> = modules
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    out.push_str("# Layers. Rename these to mean something: ui, service, engine...
+");
+    out.push_str("layers = [");
+    out.push_str(
+        &layers
+            .iter()
+            .map(|l| format!("\"{}\"", l))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    out.push_str("]
+
+");
+
+    out.push_str("# Files matching these are skipped by boundary rules unless a rule sets
+");
+    out.push_str("# include_tests = true. A rule that flags every test file is a rule that
+");
+    out.push_str("# gets disabled on day one.
+");
+    out.push_str("test_globs = [");
+    out.push_str(
+        &crate::core::config::DEFAULT_TEST_GLOBS
+            .iter()
+            .map(|g| format!("\"{}\"", g))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    out.push_str("]
+");
+
+    for (name, path) in &modules {
+        out.push_str("
+[[module]]
+");
+        out.push_str(&format!("name = \"{}\"\n", name));
+        out.push_str(&format!("layer = \"{}\"\n", name));
+        out.push_str(&format!("path = \"{}\"\n", path));
+    }
+
+    Ok(out)
+}
+
+pub fn write_draft_config(root: &Path) -> Result<DraftOutcome, Box<dyn std::error::Error>> {
+    let path = root.join(".archex/config.toml");
+    if path.exists() {
+        return Ok(DraftOutcome::Skipped { path });
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, draft_config(root)?)?;
+    Ok(DraftOutcome::Written(path))
+}
+
+/// `@fitness/engine` -> `engine`. A scope is a publishing namespace, not an
+/// architecture layer, and a slash in a layer name would collide with every
+/// layer-or-module rule. If two packages reduce to the same short name the
+/// later one keeps its full name: a draft that silently drops a package is
+/// worse than an ugly name a human is about to edit anyway.
+fn short_name(pkg: &str, taken: &[(String, String)]) -> String {
+    let short = pkg.rsplit('/').next().unwrap_or(pkg).to_string();
+    if taken.iter().any(|(name, _)| *name == short) {
+        return pkg.to_string();
+    }
+    short
+}
+
+fn package_name(body: &str) -> Option<String> {
+    let json = crate::core::resolve::parse_json_loose(body)?;
+    json.get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn expand_glob_pub(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    crate::core::resolve::expand_glob_for(root, pattern)
 }
 
 #[cfg(test)]
@@ -384,7 +502,7 @@ mod draft_tests {
         let dir = tempfile::tempdir().unwrap();
         workspace(dir.path());
         let draft = draft_config(dir.path()).expect("draft");
-        let config = Config::parse_str(&draft).expect("the draft must parse");
+        let config = Config::parse_str(&draft).unwrap_or_else(|e| panic!("draft did not parse: {}\n---\n{}", e, draft));
 
         assert_eq!(config.modules.len(), 2);
         let engine = config.modules.iter().find(|m| m.name == "engine").unwrap();

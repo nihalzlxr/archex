@@ -55,14 +55,25 @@ fn init_twice_is_idempotent() {
         .success();
 
     let first = counts(dir.path());
-    // 6, not 16: a curated module whose directory holds no code is dropped
-    // rather than seeded empty. The fixture has app, app/api, components,
-    // db, lib, services -- the other 10 curated entries have no files here,
-    // and on a real repo (LORB) 10 of 16 matched nothing.
-    assert_eq!(first.0, 6, "seeded modules must be exactly the ones with files in them");
+    // Asserted against whatever init DRAFTED, not against a hardcoded count:
+    // a test that pins a number from a deleted feature is a test that stops
+    // testing anything the moment that feature changes again.
+    let draft = std::fs::read_to_string(dir.path().join(".archex/config.toml"))
+        .expect("init drafts a config when the repo has none");
+    let drafted_modules = draft.lines().filter(|l| l.trim() == "[[module]]").count();
+    assert!(
+        drafted_modules > 0,
+        "the draft must propose at least one module:\n{}",
+        draft
+    );
+    assert_eq!(
+        first.0, drafted_modules as i64,
+        "indexed modules must be exactly the drafted ones"
+    );
     assert!(first.1 > 0, "symbols should be extracted");
     assert!(first.2 > 0, "imports should be extracted");
-    assert_eq!(rule_count(dir.path()), 8, "Next.js seeding must create exactly 8 rules (2 app, 2 components, 3 api, 1 services)");
+    // The curated Next.js seed is gone. Rules are written by humans now.
+    assert_eq!(rule_count(dir.path()), 0, "seeding creates no rules");
     assert!(duplicate_module_names(dir.path()).is_empty(), "no duplicate module names after first init");
 
     // Second init: answer "y" to the reinitialize prompt.
@@ -79,6 +90,6 @@ fn init_twice_is_idempotent() {
         second, first,
         "init run twice must not duplicate modules, symbols, or imports (got {second:?}, expected {first:?})"
     );
-    assert_eq!(rule_count(dir.path()), 8, "rules must not duplicate or vanish on re-init");
+    assert_eq!(rule_count(dir.path()), 0, "re-init must not invent rules");
     assert!(duplicate_module_names(dir.path()).is_empty(), "no duplicate module names after second init");
 }
