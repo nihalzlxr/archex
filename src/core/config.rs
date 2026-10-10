@@ -4,6 +4,143 @@
 //! infers a bootstrap default (see `cli::init::seeding_plan`), which is a
 //! guess; with it, the humans own the architecture and archex enforces it.
 
+
+use serde::Deserialize;
+
+/// The config format this build understands. A newer file is a hard error,
+/// not something to guess at.
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+
+/// Files matched here are skipped by boundary rules unless a rule opts in.
+/// Safe behaviour by default: a rule that flags every test file is a rule
+/// that gets disabled on day one.
+pub const DEFAULT_TEST_GLOBS: &[&str] = &[
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "**/test/**",
+    "**/tests/**",
+    "**/__tests__/**",
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub schema_version: i64,
+    pub name: String,
+    pub layers: Vec<String>,
+    #[serde(default)]
+    pub test_globs: Option<Vec<String>>,
+    #[serde(default, rename = "module")]
+    pub modules: Vec<ModuleConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleConfig {
+    pub name: String,
+    pub layer: String,
+    pub path: String,
+}
+
+#[derive(Debug)]
+pub struct ConfigError(pub String);
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl Config {
+    pub fn test_globs(&self) -> Vec<&str> {
+        match &self.test_globs {
+            Some(globs) => globs.iter().map(|g| g.as_str()).collect(),
+            None => DEFAULT_TEST_GLOBS.to_vec(),
+        }
+    }
+
+    pub fn parse_str(body: &str) -> Result<Self, ConfigError> {
+        let value: toml::Value =
+            toml::from_str(body).map_err(|e| ConfigError(format!("invalid TOML: {}", e)))?;
+
+        // A bare key after a table header is absorbed into that table by
+        // TOML's own rules, so `layers = [...]` under a [[module]] parses
+        // cleanly and leaves the top level empty. Catch it before
+        // serde does, while we still know the key was misplaced.
+        if let Some(misplaced) = misplaced_top_level_key(&value) {
+            return Err(ConfigError(format!(
+                "`{}` must appear before any [[module]] table: a bare key after a                  table header is silently absorbed into that table, so it never                  reaches the top level.",
+                misplaced
+            )));
+        }
+
+        let config: Config = value
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError(format!("invalid config: {}", e)))?;
+
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn load(root: &std::path::Path) -> Result<Self, ConfigError> {
+        let path = root.join(".archex/config.toml");
+        let body = std::fs::read_to_string(&path).map_err(|e| {
+            ConfigError(format!("cannot read {}: {}", path.display(), e))
+        })?;
+        Self::parse_str(&body)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.schema_version != SUPPORTED_SCHEMA_VERSION {
+            return Err(ConfigError(format!(
+                "schema_version {} is not supported (this build understands {})",
+                self.schema_version, SUPPORTED_SCHEMA_VERSION
+            )));
+        }
+
+        let mut seen: Vec<&str> = Vec::new();
+        for module in &self.modules {
+            if seen.contains(&module.name.as_str()) {
+                return Err(ConfigError(format!(
+                    "duplicate module name `{}`: each module maps one directory tree",
+                    module.name
+                )));
+            }
+            seen.push(&module.name);
+
+            // An undeclared layer is a mistake, not a module that quietly
+            // matches nothing. A gate that silently passes is worse than one
+            // that refuses to start.
+            if !self.layers.iter().any(|l| l == &module.layer) {
+                return Err(ConfigError(format!(
+                    "module `{}` is in layer `{}`, which is not declared in layers = [...]",
+                    module.name, module.layer
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Names that must live at the top level, checked for accidental capture by
+/// a table header.
+fn misplaced_top_level_key(value: &toml::Value) -> Option<String> {
+    let table = value.as_table()?;
+    const MUST_BE_TOP_LEVEL: &[&str] = &["schema_version", "layers", "test_globs"];
+    for module in table.get("module")?.as_array()? {
+        let module = module.as_table()?;
+        for key in MUST_BE_TOP_LEVEL {
+            if module.contains_key(*key) {
+                return Some((*key).to_string());
+            }
+        }
+    }
+    None
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,14 +179,14 @@ path = "packages/engine/**"
 
     #[test]
     fn test_globs_default_when_absent() {
-        let cfg = parse("schema_version = 1\nlayers = []\n").expect("valid");
+        let cfg = parse("schema_version = 1\nname = \"x\"\nlayers = []\n").expect("valid");
         assert_eq!(cfg.test_globs(), DEFAULT_TEST_GLOBS);
     }
 
     #[test]
     fn test_globs_override_the_default() {
         let cfg = parse(
-            "schema_version = 1\nlayers = []\ntest_globs = [\"spec/**/*.spec.ts\"]\n",
+            "schema_version = 1\nname = \"x\"\nlayers = []\ntest_globs = [\"spec/**/*.spec.ts\"]\n",
         )
         .expect("valid");
         assert_eq!(cfg.test_globs(), vec!["spec/**/*.spec.ts"]);
@@ -63,6 +200,9 @@ path = "packages/engine/**"
     fn layers_misplaced_after_a_module_header_is_rejected() {
         let err = parse(
             r#"
+schema_version = 1
+name = "x"
+
 [[module]]
 name = "web"
 layer = "ui"
@@ -81,7 +221,7 @@ layers = ["ui"]
     /// deny_unknown_fields catches every typo, not just the one above.
     #[test]
     fn unknown_top_level_key_is_rejected() {
-        let err = parse("schema_version = 1\nlayers = []\nlayerz = [\"ui\"]\n")
+        let err = parse("schema_version = 1\nname = \"x\"\nlayers = []\nlayerz = [\"ui\"]\n")
             .expect_err("must not parse");
         assert!(err.to_string().contains("layerz"), "{}", err);
     }
@@ -99,6 +239,8 @@ layers = ["ui"]
     fn duplicate_module_names_are_rejected() {
         let err = parse(
             r#"
+schema_version = 1
+name = "x"
 layers = ["ui"]
 [[module]]
 name = "web"
@@ -120,6 +262,8 @@ path = "apps/web-admin/**"
     fn module_in_an_undeclared_layer_is_rejected() {
         let err = parse(
             r#"
+schema_version = 1
+name = "x"
 layers = ["ui"]
 [[module]]
 name = "engine"
@@ -135,19 +279,19 @@ path = "packages/engine/**"
     #[test]
     fn a_layer_with_no_modules_is_allowed() {
         // Declaring a layer ahead of the module that uses it is fine.
-        let cfg = parse("layers = [\"ui\", \"service\"]\n").expect("valid");
+        let cfg = parse("schema_version = 1\nname = \"x\"\nlayers = [\"ui\", \"service\"]\n").expect("valid");
         assert_eq!(cfg.layers.len(), 2);
     }
 
     #[test]
     fn schema_version_must_be_known() {
-        let err = parse("schema_version = 99\nlayers = []\n").expect_err("must not parse");
+        let err = parse("schema_version = 99\nname = \"x\"\nlayers = []\n").expect_err("must not parse");
         assert!(err.to_string().contains("schema_version"), "{}", err);
     }
 
     #[test]
     fn name_is_required() {
-        let err = parse("layers = []\n").expect_err("must not parse");
+        let err = parse("schema_version = 1\nlayers = []\n").expect_err("must not parse");
         assert!(err.to_string().contains("name"), "{}", err);
     }
 
