@@ -20,8 +20,12 @@ enum Commands {
         agent: Option<String>,
     },
     Check {
+        /// Check one file instead of the whole tree.
         #[arg(long)]
-        file_path: String,
+        file_path: Option<String>,
+        /// Fail on rules that match nothing, not just on violations.
+        #[arg(long)]
+        strict: bool,
     },
     Rule {
         #[command(subcommand)]
@@ -51,12 +55,22 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Check { file_path } => {
-            if let Err(e) = cli::check::run(file_path) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+        Commands::Check { file_path, strict } => match file_path {
+            Some(path) => {
+                if let Err(e) = cli::check::run(path) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
-        }
+            None => match cli::check::run_gate(strict) {
+                Ok(true) => {}
+                Ok(false) => std::process::exit(1),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+        },
         Commands::Rule { command } => {
             if let Err(e) = cli::rule::run(command) {
                 eprintln!("Error: {}", e);

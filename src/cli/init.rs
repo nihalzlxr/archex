@@ -1,3 +1,5 @@
+use crate::core::boundary;
+use crate::core::config::Config;
 use crate::core::db::{Db, DB_PATH};
 use crate::core::parser::{Parser, SKIP_DIRS, VALID_EXTENSIONS};
 use std::fs;
@@ -25,8 +27,12 @@ pub(crate) struct RuleSpec {
 pub fn run() {
     let project_root = std::env::current_dir().expect("Failed to get current directory");
 
-    if Path::new(ARCHEX_DIR).exists() {
-        eprint!("Already initialized. Reinitialize? (y/n): ");
+    // Prompt only when there is an INDEX to overwrite. Once config.toml is
+    // committed, `.archex/` always exists -- so prompting on the directory
+    // would make `init` unusable in exactly the repos that adopted it.
+    let index_exists = Path::new(DB_PATH).exists();
+    if index_exists {
+        eprint!("An index already exists. Rebuild it? (y/n): ");
         std::io::stderr().flush().unwrap();
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer).unwrap();
@@ -45,10 +51,35 @@ pub fn run() {
 
     let project_type = detect_project_type(&project_root);
 
-    let modules_seeded = {
-        let plan = seeding_plan(&project_root, &project_type);
-        eprintln!("Seeding {} module(s) from {}.", plan.len(), project_type.label());
-        seed_modules(&db, &plan)
+    // A committed config is the architecture. It REPLACES the inferred
+    // bootstrap default rather than merging with it -- merging makes a module
+    // impossible to delete.
+    let modules_seeded = match Config::load(&project_root) {
+        Ok(config) => {
+            eprintln!(
+                "Using committed .archex/config.toml ({} modules).",
+                config.modules.len()
+            );
+            match boundary::install_modules(&db, &config) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to install modules: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(_) => {
+            let plan = seeding_plan(&project_root, &project_type);
+            eprintln!(
+                "No .archex/config.toml yet: seeding {} bootstrap module(s) from {}.",
+                plan.len(),
+                project_type.label()
+            );
+            eprintln!(
+                "These are a GUESS. Write .archex/config.toml to make the                  architecture yours."
+            );
+            seed_modules(&db, &plan)
+        }
     };
 
     eprintln!("Scanning files...");

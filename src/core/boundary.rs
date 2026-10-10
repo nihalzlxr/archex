@@ -34,6 +34,8 @@ pub struct Finding {
     pub from_file: String,
     pub to_file: String,
     pub line_number: i64,
+    /// The specifier as written. A finding has to show its evidence.
+    pub imported_from: String,
     pub message: String,
 }
 
@@ -79,6 +81,7 @@ struct Edge {
     from_file: String,
     to_file: String,
     line_number: i64,
+    imported_from: String,
     from_module: String,
     to_module: String,
 }
@@ -91,7 +94,6 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
         .collect();
 
     let (edges, coverage) = collect_edges(db)?;
-    for e in &edges { eprintln!("EDGE {}:{} -> {} ({} -> {})", e.from_file, e.line_number, e.to_file, e.from_module, e.to_module); }
     let test_globs = config.test_globs().iter().map(|g| g.to_string()).collect::<Vec<_>>();
 
     let mut report = BoundaryReport {
@@ -156,6 +158,7 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
                 from_file: edge.from_file.clone(),
                 to_file: edge.to_file.clone(),
                 line_number: edge.line_number,
+                imported_from: edge.imported_from.clone(),
                 message: boundary.message.clone(),
             });
         }
@@ -211,6 +214,7 @@ fn collect_edges(db: &Db) -> Result<(Vec<Edge>, Coverage), ConfigError> {
                 from_file: file.clone(),
                 to_file: target,
                 line_number: import.line_number,
+                imported_from: import.imported_from,
                 from_module,
                 to_module,
             });
@@ -230,21 +234,28 @@ fn resolve_side(
     let is_layer = layer_of.values().any(|l| l == name);
     let is_module = modules.iter().any(|m| m.name == name);
 
+    let layer_modules: BTreeSet<String> = layer_of
+        .iter()
+        .filter(|(_, layer)| *layer == name)
+        .map(|(module, _)| module.clone())
+        .collect();
+
     match (is_layer, is_module) {
+        // Both readings are available. Reject only when they disagree:
+        // accepting a name whose two readings name the same set of modules
+        // cannot change what the rule means, and in a monorepo
+        // `name = "engine", layer = "engine"` is the obvious thing to write.
+        (true, true) if layer_modules.len() == 1 && layer_modules.contains(name) => Ok(layer_modules),
         (true, true) => Err(format!(
-            "`{}` is both a layer and a module name: rename one of them",
-            name
+            "`{}` is both a layer and a module name, and they do not mean the \
+             same thing: as a layer it covers {:?}, as a module it covers only \
+             itself. Rename one of them, or use a name that is unambiguous",
+            name,
+            layer_modules.iter().collect::<Vec<_>>()
         )),
-        (true, false) => Ok(layer_of
-            .iter()
-            .filter(|(_, layer)| *layer == name)
-            .map(|(module, _)| module.clone())
-            .collect()),
+        (true, false) => Ok(layer_modules),
         (false, true) => Ok([name.to_string()].into_iter().collect()),
-        (false, false) => Err(format!(
-            "`{}` is neither a declared layer nor a module",
-            name
-        )),
+        (false, false) => Err(format!("`{}` is neither a declared layer nor a module", name)),
     }
 }
 
@@ -303,7 +314,6 @@ path = "packages/content/**"
 "#;
 
     struct Repo {
-        dir: tempfile::TempDir,
         db: crate::core::db::Db,
     }
 
@@ -346,7 +356,7 @@ path = "packages/content/**"
         crate::core::parser::Parser::new(std::sync::Arc::new(db.clone()))
             .scan(dir.path())
             .expect("scan");
-        Repo { dir, db }
+        Repo { db }
     }
 
     fn engine_files() -> Vec<(&'static str, &'static str)> {
@@ -594,8 +604,13 @@ layer = "ui"
 path = "apps/web/**"
 
 [[module]]
-name = "engine"
+name = "admin"
 layer = "engine"
+path = "apps/admin/**"
+
+[[module]]
+name = "engine"
+layer = "ui"
 path = "packages/engine/**"
 "#,
         )
@@ -762,5 +777,84 @@ message = "m"
         let globs = vec!["packages/engine/src/index.ts".to_string(), "packages/content/src/*.ts".to_string()];
         assert!(matches_any("packages/content/src/repo.ts", &globs));
         assert!(!matches_any("packages/content/src/deep/repo.ts", &globs));
+    }
+}
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    fn layer_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(m, l)| (m.to_string(), l.to_string()))
+            .collect()
+    }
+
+    fn modules(pairs: &[(&str, &str)]) -> Vec<crate::core::config::ModuleConfig> {
+        pairs
+            .iter()
+            .map(|(name, layer)| crate::core::config::ModuleConfig {
+                name: name.to_string(),
+                layer: layer.to_string(),
+                path: format!("{}/**", name),
+            })
+            .collect()
+    }
+
+    /// A module named after its own layer is the obvious thing to write in a
+    /// monorepo, and both readings name the same modules, so it is not
+    /// ambiguous and must not be rejected.
+    #[test]
+    fn a_module_named_after_its_own_layer_is_accepted() {
+        let resolved = resolve_side(
+            &layer_map(&[("engine", "engine")]),
+            &modules(&[("engine", "engine")]),
+            "engine",
+        )
+        .expect("unambiguous");
+        assert_eq!(resolved.into_iter().collect::<Vec<_>>(), vec!["engine"]);
+    }
+
+    /// Here the two readings differ: as a layer it covers every ui module, as
+    /// a module only itself. Reject it rather than guess.
+    #[test]
+    fn a_name_whose_two_readings_differ_is_rejected() {
+        // A layer named `engine` covering web + admin, alongside a MODULE
+        // named `engine`: the two readings name different module sets.
+        let err = resolve_side(
+            &layer_map(&[("web", "engine"), ("admin", "engine")]),
+            &modules(&[("web", "engine"), ("admin", "engine"), ("engine", "ui")]),
+            "engine",
+        )
+        .expect_err("must be ambiguous");
+        assert!(err.contains("both a layer and a module"), "{}", err);
+    }
+
+    #[test]
+    fn a_layer_covering_several_modules_resolves_to_all_of_them() {
+        let resolved = resolve_side(
+            &layer_map(&[("web", "ui"), ("admin", "ui")]),
+            &modules(&[("web", "ui"), ("admin", "ui")]),
+            "ui",
+        )
+        .expect("valid");
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn config_loading_reports_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".archex/rules")).unwrap();
+        std::fs::write(
+            dir.path().join(".archex/config.toml"),
+            "schema_version = 1\nname = \"x\"\nlayers = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".archex/rules/bad.toml"),
+            "schema_version = 1\nid = \"bad\"\nstatus = \"accepted\"\nkind = \"boundary\"\nseverity = \"error\"\n",
+        )
+        .unwrap();
+        let err = crate::core::config::load_rules(dir.path()).expect_err("bad rule");
+        assert!(err.to_string().contains("bad.toml"), "{}", err);
     }
 }

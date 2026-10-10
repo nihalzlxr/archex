@@ -219,6 +219,9 @@ pub struct BoundaryRule {
     pub message: String,
 }
 
+/// Read by the pattern engine, which the legacy DB-backed rules still serve
+/// via `check --file-path`; the file-based engine is the next slice.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatternRule {
@@ -236,6 +239,7 @@ pub enum PatternMode {
     Warning,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PresenceRule {
@@ -679,4 +683,33 @@ message = "m"
         .expect("valid");
         assert_eq!(rule.severity, Severity::Warning);
     }
+}
+
+/// Every `rules/*.toml` in `.archex/rules/`, parsed and validated.
+pub fn load_rules(root: &std::path::Path) -> Result<Vec<Rule>, ConfigError> {
+    let dir = root.join(".archex/rules");
+    let mut entries: Vec<_> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
+        // No rules directory is a valid repo, not an error.
+        Err(_) => return Ok(Vec::new()),
+    };
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut rules = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| ConfigError(format!("cannot read {}: {}", path.display(), e)))?;
+        let mut rule = Rule::parse_str(&body)
+            .map_err(|e| ConfigError(format!("{}: {}", path.display(), e)))?;
+        rule.id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(rule.id);
+        rules.push(rule);
+    }
+    Ok(rules)
 }

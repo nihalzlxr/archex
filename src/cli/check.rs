@@ -123,3 +123,99 @@ pub fn run(file_path: String) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+/// The gate: whole-repo, config-driven, exit code 1 on an error-severity
+/// finding.
+///
+/// `archex check --file-path` is a per-file convenience for an agent mid-edit.
+/// The gate is the promise, and it runs over the whole tree.
+pub fn run_gate(strict: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    use crate::core::boundary;
+    use crate::core::config::{self, Config};
+
+    let root = std::env::current_dir()?;
+    let db = Db::shared(Path::new(DB_PATH))?;
+
+    db.init_schema()?;
+    if db.get_all_modules()?.is_empty() {
+        return Err("no modules in the index. Run `archex init` first.".into());
+    }
+
+    let config = Config::load(&root).map_err(|e| format!(
+        "{}\n\nThe gate needs a committed architecture. Run `archex init` to draft one.",
+        e
+    ))?;
+    let rules = config::load_rules(&root)?;
+
+    let report = boundary::check(&db, &config, &rules)?;
+
+    println!("Architecture gate: {}", config.name);
+    println!(
+        "  {} files in modules, {} unclassified",
+        report.classified_files, report.unclassified_files
+    );
+    println!(
+        "  {} imports unclassified (never a violation, never silently clean)",
+        report.unresolved_imports
+    );
+    println!("  {} rule(s) loaded", rules.len());
+
+    // Per-rule visibility. A rule that matches nothing is indistinguishable
+    // from a rule that does not exist, so say which one this is: an empty
+    // side is almost certainly a typo, while two populated sides with no
+    // edges is simply a clean result.
+    let mut suspicious: Vec<String> = Vec::new();
+    for rule in &rules {
+        if !rule.is_active() || rule.boundary.is_none() {
+            continue;
+        }
+        let Some(status) = report.rule_status(&rule.id) else {
+            continue;
+        };
+        println!(
+            "    {}: {} from-file(s), {} to-file(s), {} candidate edge(s){}",
+            rule.id, status.from_files, status.to_files, status.edges,
+            if rule.status == crate::core::config::Status::Retired {
+                " [retired]"
+            } else {
+                ""
+            }
+        );
+        if status.suspicious {
+            suspicious.push(format!(
+                "  rule `{}`: {} file(s) on the from side, {} on the to side -- \
+                 one side is empty, so this rule matches nothing",
+                rule.id, status.from_files, status.to_files
+            ));
+        }
+    }
+    for line in &suspicious {
+        eprintln!("{}", line);
+    }
+
+    if report.findings.is_empty() {
+        println!("\n  No violations.");
+    } else {
+        println!("\n  {} violation(s):", report.findings.len());
+        for finding in &report.findings {
+            println!(
+                "    {}:{}  [{}] {}",
+                finding.from_file, finding.line_number, finding.rule_id, finding.message
+            );
+            println!(
+                "        imports {} -> {}",
+                finding.imported_from, finding.to_file
+            );
+        }
+    }
+
+    let errors = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == crate::core::config::Severity::Error)
+        .count();
+
+    if strict && !suspicious.is_empty() {
+        return Ok(false);
+    }
+    Ok(errors == 0)
+}

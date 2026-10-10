@@ -13,6 +13,15 @@ pub const DB_PATH: &str = ".archex/archex.db";
 /// migration would be code that only ever runs once, on machines nobody has.
 pub const SCHEMA_VERSION: i64 = 2;
 
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 /// Every table the index owns. Dropped wholesale on a version mismatch.
 const OWNED_TABLES: &[&str] = &[
     "symbols",
@@ -246,10 +255,13 @@ impl Db {
             )
             .ok();
 
-        let stale = match recorded {
-            None => false,
-            Some(value) => value.parse::<i64>().ok() != Some(SCHEMA_VERSION),
-        };
+        // No meta table but archex tables present means a database written
+        // before versioning existed: its shape is whatever it was, so treat
+        // it as stale. Neither table means a fresh database, nothing to drop.
+        let pre_versioning = recorded.is_none() && table_exists(conn, "modules");
+
+        let stale = pre_versioning
+            || matches!(&recorded, Some(value) if value.parse::<i64>().ok() != Some(SCHEMA_VERSION));
 
         if stale {
             for table in OWNED_TABLES {
@@ -502,9 +514,17 @@ impl Db {
     /// Modules come from the committed config when it exists, so seeding
     /// output can be replaced outright -- otherwise a module could never be
     /// deleted.
+    /// Replacing the module set invalidates every row that points at one.
+    /// With foreign keys actually ENABLED (they are, since WAL), deleting
+    /// modules out from under their rows is a constraint violation, not a
+    /// silent success.
     pub fn clear_modules(&self) -> Result<()> {
         let conn = self.lock();
-        conn.execute("DELETE FROM modules", [])?;
+        let tx = conn.unchecked_transaction()?;
+        for table in ["file_map", "rules", "symbols", "imports", "modules"] {
+            tx.execute(&format!("DELETE FROM {}", table), [])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
