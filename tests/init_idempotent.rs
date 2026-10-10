@@ -55,7 +55,11 @@ fn init_twice_is_idempotent() {
         .success();
 
     let first = counts(dir.path());
-    assert_eq!(first.0, 16, "Next.js seeding must create exactly 16 modules");
+    // 6, not 16: a curated module whose directory holds no code is dropped
+    // rather than seeded empty. The fixture has app, app/api, components,
+    // db, lib, services -- the other 10 curated entries have no files here,
+    // and on a real repo (LORB) 10 of 16 matched nothing.
+    assert_eq!(first.0, 6, "seeded modules must be exactly the ones with files in them");
     assert!(first.1 > 0, "symbols should be extracted");
     assert!(first.2 > 0, "imports should be extracted");
     assert_eq!(rule_count(dir.path()), 8, "Next.js seeding must create exactly 8 rules (2 app, 2 components, 3 api, 1 services)");

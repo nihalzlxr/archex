@@ -102,24 +102,32 @@ impl ProjectType {
 /// list of modules and will not care where it came from.
 fn seeding_plan(root: &Path, project_type: &ProjectType) -> Vec<ModuleSpec> {
     match project_type {
-        // `next` in the manifest guarantees the src/app, src/components
-        // convention, so the curated modules and their real layers are
-        // knowledge, not a guess. Keep them.
-        ProjectType::NextJs => nextjs_plan(),
+        // `next` in the manifest guarantees the src/app route convention, so
+        // the curated modules keep their real layers. It guarantees nothing
+        // about src/db or src/services: on LORB, 10 of the 16 matched zero
+        // files and left 77% of the repo unclassified. So the curated list
+        // survives as an overlay on top of the generic plan, not as a
+        // replacement for it.
+        ProjectType::NextJs => {
+            let mut plan = nextjs_plan(root);
+            plan.extend(generic_plan(root, &plan));
+            plan
+        }
         // No framework convention to lean on. Take the directory names as
         // they are: a module per top-level directory, layer = the name, no
         // rules. archex does not know that `lib` is a service layer, and in
         // Step 2 a wrong layer is not wrong context, it is a false violation
         // from a rule that checks `from_layer`/`to_layer`.
-        _ => generic_plan(root),
+        _ => generic_plan(root, &[]),
     }
 }
 
-/// One module per top-level directory that contains at least one indexable
-/// file. Directories holding only docs or assets get no module: a module that
-/// maps zero files is noise that later reads as "there is an architecture
-/// here".
-fn generic_plan(root: &Path) -> Vec<ModuleSpec> {
+/// One module per top-level directory that holds indexable files the curated
+/// overlay does not already claim. A directory holding only docs or assets
+/// gets no module, and neither does one the overlay covers completely --
+/// otherwise every Next.js repo grows a second, empty `src` module.
+fn generic_plan(root: &Path, curated: &[ModuleSpec]) -> Vec<ModuleSpec> {
+    let overlay = compile_patterns(curated);
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
@@ -129,7 +137,12 @@ fn generic_plan(root: &Path) -> Vec<ModuleSpec> {
         .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter(|entry| !is_skipped_dir(&entry.path()))
         .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-        .filter(|entry| has_indexable_file(&entry.path()))
+        .filter(|entry| has_indexable_file(root, &entry.path()))
+        .filter(|entry| {
+            // Only worth a module if the overlay leaves something behind.
+            indexable_files(root, &entry.path())
+                .any(|file| !overlay.iter().any(|p| p.matches(&file)))
+        })
         .map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
             ModuleSpec {
@@ -145,6 +158,13 @@ fn generic_plan(root: &Path) -> Vec<ModuleSpec> {
     specs
 }
 
+fn compile_patterns(specs: &[ModuleSpec]) -> Vec<glob::Pattern> {
+    specs
+        .iter()
+        .filter_map(|spec| glob::Pattern::new(&spec.path_pattern).ok())
+        .collect()
+}
+
 /// Reuse the scanner's skip list instead of keeping a second one that drifts.
 fn is_skipped_dir(path: &Path) -> bool {
     path.file_name()
@@ -152,19 +172,33 @@ fn is_skipped_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn has_indexable_file(dir: &Path) -> bool {
+fn is_indexable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| VALID_EXTENSIONS.contains(&ext))
+        .unwrap_or(false)
+}
+
+/// Every indexable file under `dir`, as a repo-relative forward-slashed path
+/// (the form both the scanner and the overlay patterns use), with the same
+/// skip list the scanner uses.
+fn indexable_files<'a>(root: &'a Path, dir: &'a Path) -> impl Iterator<Item = String> + 'a {
+    let prefix = root.to_string_lossy().trim_end_matches('/').to_string();
     walkdir::WalkDir::new(dir)
         .into_iter()
-        .filter_entry(|e| !is_skipped_dir(e.path()) || e.depth() == 0)
+        .filter_entry(|e| e.depth() == 0 || !is_skipped_dir(e.path()))
         .filter_map(|e| e.ok())
-        .any(|e| {
-            e.file_type().is_file()
-                && e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| VALID_EXTENSIONS.contains(&ext))
-                    .unwrap_or(false)
+        .filter(|e| e.file_type().is_file() && is_indexable(e.path()))
+        .map(move |e| {
+            let path = e.path().to_string_lossy().replace('\\', "/");
+            path.strip_prefix(&prefix)
+                .map(|rest| rest.trim_start_matches('/').to_string())
+                .unwrap_or(path)
         })
+}
+
+fn has_indexable_file(root: &Path, dir: &Path) -> bool {
+    indexable_files(root, dir).next().is_some()
 }
 
 /// Insert whatever the plan says is missing. Idempotent per module and per
@@ -207,7 +241,11 @@ fn seed_modules(db: &Db, plan: &[ModuleSpec]) -> usize {
     seeded
 }
 
-fn nextjs_plan() -> Vec<ModuleSpec> {
+/// The curated list is an overlay, not the whole architecture: an entry whose
+/// directory holds no indexable file is dropped rather than seeded empty. A
+/// module that maps zero files is noise that later reads as "there is an
+/// architecture here", and the rules hanging off it can never fire.
+fn nextjs_plan(root: &Path) -> Vec<ModuleSpec> {
     let modules: &[(&str, &str, &str)] = &[
         ("app", "ui", "src/app/**"),
         ("components", "ui", "src/components/**"),
@@ -248,6 +286,9 @@ fn nextjs_plan() -> Vec<ModuleSpec> {
 
     modules
         .iter()
+        // Existence is checked against the pattern's directory (src/app),
+        // not the module name (app).
+        .filter(|(_, _, pattern)| has_indexable_file(root, &root.join(pattern.trim_end_matches("/**"))))
         .map(|(name, layer, pattern)| ModuleSpec {
             name: name.to_string(),
             layer: layer.to_string(),
