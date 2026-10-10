@@ -82,6 +82,19 @@ and enforces nothing.
    **Note:** a DB rule is keyed by module *name*. `migrate` should REFUSE a
    rule whose module has no layer in `config.toml`, with a clear message,
    rather than invent one.
+5. **The `imports.kind` column rides the same SCHEMA_VERSION 2→3 bump.**
+   Classify by syntax only: `import type` → `type-only`, `import()` →
+   `dynamic`, then relative / aliased / package by specifier shape;
+   unresolved stays unclassified. One column; the boundary engine consults
+   it for `include_type_only` (default skip, §5 of PLAN.md). Nothing else
+   in this unit — no new rule kinds over import kind, no transitive work
+   (the rule-matching unit's lesson: 2.5 must not balloon). The
+   identical-findings fixture needs a type-only cross-boundary import so
+   default-skip is exercised on both paths. Why here and not Step 3:
+   `include_type_only` is already in the §5 schema and cannot be honored
+   without the kind data (the same accepted-but-does-nothing failure that
+   got `reachable = true` rejected); one bump beats two rebuilds; and 713
+   of LORB's 10,638 edges (6.7%) are type-only.
 
 After that, Step 3 can start; the ledger file formats reuse the same loader
 and validator.

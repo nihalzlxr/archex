@@ -251,7 +251,7 @@ File-level resolved imports first. **The hard part is TypeScript** — `tsconfig
 | **0** | Truthful core: idempotent init, symbol dedup (`clear_file_symbols` wired), shared case-correct regex helper, `exported` + signature extraction fixes, WAL + one shared connection, path normalization, dead code deleted, generic module seeding, **fixture tests + full suite** | `init` twice clean; suite green | ✅ done — 176 tests, zero warnings |
 | **1** | **Eval harness**: ~20 real LORB commits, ground truth = files each commit touched; Hit@3, MRR, function accuracy; baselines = plain grep + current archex | Numbers recorded | ✅ done — see below. Run on `project/fitness`; LORB reserved for Step 2 (below) |
 | **2** | **The Gate**: file-level import resolution, rules as data, `archex check` + CI job, baseline mode | ≥1 real violation caught on LORB; **zero false positives on a clean tree** | ✅ done — both halves, on LORB |
-| **2.5** | **One source of truth for rules.** Gate, `check --file-path` and MCP `check_drift` load `.archex/rules/*.toml` through **one loader and one engine**. `rule add` writes a validated file through the real validator (canonical serialization; flags grow `--from --to --allow-to --severity`, or boundary rules stay CLI-unreachable); `rule remove` **retires** by default (`status = "retired"`), `--purge` deletes; `archex rule migrate` converts DB rules — refusing any whose module has no layer in `config.toml` — then the `rules` table dies at the next schema bump. Legacy DB rules warn once on startup, then migrate | **The per-file advisory result for file X equals the gate's findings filtered to X** — measured on a fixture where X contains at least one violation, so the assertion cannot pass vacuously. Advisory and gate must never disagree, or agents learn to distrust the advisory | ⬜ next — full approach in `RESUME.md` |
+| **2.5** | **One source of truth for rules.** Gate, `check --file-path` and MCP `check_drift` load `.archex/rules/*.toml` through **one loader and one engine**. `rule add` writes a validated file through the real validator (canonical serialization; flags grow `--from --to --allow-to --severity`, or boundary rules stay CLI-unreachable); `rule remove` **retires** by default (`status = "retired"`), `--purge` deletes; `archex rule migrate` converts DB rules — refusing any whose module has no layer in `config.toml` — then the `rules` table dies **and the `imports.kind` column arrives in the same SCHEMA_VERSION 2→3 bump** (5 kinds: relative | aliased | package | type-only | dynamic; the boundary engine honors `include_type_only`). Legacy DB rules warn once on startup, then migrate | **The per-file advisory result for file X equals the gate's findings filtered to X** — measured on a fixture where X contains at least one violation, *including a type-only cross-boundary import so default-skip is exercised on both paths*, so the assertion cannot pass vacuously. Advisory and gate must never disagree, or agents learn to distrust the advisory | ⬜ next — full approach in `RESUME.md` |
 | **3** | **The Ledger**: file formats + validator, `archex sync`, brief injection, `decide` CLI, `record_decision` MCP tool | An agent logs a decision mid-session; the next session starts knowing it | ⬜ not started |
 | **4** | Retrieval surface: FTS5 word-split search, `search`/`traverse`/`read` with token budgets, stable ordering | Measurable gain over the Step 1 baseline | ⬜ not started |
 | **5** | Conditional: symbol edges, PageRank repo map | Only if Step 4 leaves retrieval as the proven bottleneck | ⬜ not started |
@@ -471,6 +471,28 @@ Steals with sources. Each is small now, expensive after Step 3+.
    per-rule (`include_type_only`, default `true` = skip, precision-first),
    not a hardcoded exemption — see §5. dependency-cruiser's model is the
    same shape: a kind you can forbid or allow, never a blanket skip.
+
+   **Sequencing decided (2026-10-10): the `kind` column ships in Step 2.5,
+   in the same SCHEMA_VERSION 2→3 bump that drops the `rules` table.**
+   (a) §5 already carries `include_type_only` — a field whose default-skip
+   behavior cannot be honored without kind data is the same
+   accepted-but-does-nothing failure `reachable = true` was rejected for;
+   refusing it at validation until Step 3 is absurd for a small parser
+   change. (b) Two bumps in two weeks means every active machine rebuilds
+   its index twice — bumps carry batches. (c) The gate is live on LORB, and
+   6.7% of its edges being indistinguishable from value imports turns wrong
+   the moment a rule crosses a type-heavy boundary. **Scope guard** (the
+   rule-matching unit's lesson — 2.5 must not balloon): classification by
+   syntax only — `import type` → type-only, `import()` → dynamic, then
+   relative / aliased / package by specifier shape; one column; the
+   boundary engine honoring `include_type_only`; and *nothing else* — no
+   new rule kinds over import kind, no transitive work. The
+   identical-findings fixture gains a type-only cross-boundary import, so
+   default-skip is exercised on both paths. Honesty note: current LORB
+   rules measured zero false positives across 218 cross-module edges — the
+   713 type-only edges have not crossed a checked boundary *yet*. This is
+   completeness for the gate that is coming, not a fix to the one that is
+   here.
 5. **Future, post-Step-3** (steal list): `archex init --import` — absorb
    existing CLAUDE.md/AGENTS.md/rules into decisions (Archcore proves
    demand); `archex status` coverage report — which decisions are
