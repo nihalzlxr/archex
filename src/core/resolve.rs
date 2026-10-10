@@ -1011,6 +1011,45 @@ mod tests {
         );
     }
 
+    /// An internals violation looks exactly like this: reaching past a
+    /// package's public entry. If it does not resolve, every internals rule
+    /// is a silent false negative.
+    #[test]
+    fn workspace_import_reaching_past_the_entry_resolves_to_the_internals_file() {
+        let fx = Fixture::new();
+        fx.json("pnpm-workspace.yaml", "packages:\n  - \"packages/*\"\n");
+        fx.json(
+            "packages/engine/package.json",
+            r#"{"name":"@fitness/engine","exports":{".":"./src/index.ts"}}"#,
+        );
+        fx.file("packages/engine/src/index.ts");
+        fx.file("packages/engine/src/internal/scheduler.ts");
+        fx.file("packages/engine/src/load.ts");
+        assert_eq!(
+            res(&fx, "packages/agent/src/x.ts", "@fitness/engine/src/internal/scheduler"),
+            Some("packages/engine/src/internal/scheduler.ts".into())
+        );
+        assert_eq!(
+            res(&fx, "packages/agent/src/x.ts", "@fitness/engine/load"),
+            Some("packages/engine/src/load.ts".into()),
+            "a subpath that is not in exports must still resolve when the file exists"
+        );
+    }
+
+    /// The other internals shape: a relative path that crosses a package
+    /// boundary.
+    #[test]
+    fn relative_import_crossing_a_package_boundary_resolves() {
+        let fx = Fixture::new();
+        fx.file("packages/engine/src/index.ts");
+        fx.file("packages/engine/src/internal/scheduler.ts");
+        fx.file("packages/agent/src/narrator.ts");
+        assert_eq!(
+            res(&fx, "packages/agent/src/narrator.ts", "../../engine/src/internal/scheduler"),
+            Some("packages/engine/src/internal/scheduler.ts".into())
+        );
+    }
+
     #[test]
     fn jsonc_comments_and_trailing_commas_parse() {
         let fx = Fixture::new();
