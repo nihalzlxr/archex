@@ -120,17 +120,6 @@ impl Db {
         })
     }
 
-    /// In-memory database for tests. No journal to speak of: SQLite keeps
-    /// `journal_mode = wal` unsupported for :memory: and that is fine.
-    pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::configure(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        })
-    }
-
     /// The process-wide connection for `path`. Five MCP tools each opened their
     /// own; they now share one, which is what makes WAL worth having.
     pub fn shared(path: &Path) -> Result<Arc<Self>> {
@@ -286,13 +275,15 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn insert_rule(&self, module_id: i64, rule_type: &str, description: &str, pattern: Option<&str>) -> Result<()> {
+    /// Returns the new rule's id: callers print it, and ids are NOT the row
+    /// count once anything has been deleted.
+    pub fn insert_rule(&self, module_id: i64, rule_type: &str, description: &str, pattern: Option<&str>) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO rules (module_id, rule_type, description, pattern) VALUES (?1, ?2, ?3, ?4)",
             (module_id, rule_type, description, pattern),
         )?;
-        Ok(())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn get_all_modules(&self) -> Result<Vec<Module>> {
@@ -411,20 +402,6 @@ impl Db {
         .collect();
         
         Ok(rules)
-    }
-
-    pub fn get_module_path(&self, module_name: &str) -> Result<Option<String>> {
-        let conn = self.lock();
-        let result: Result<String, _> = conn.query_row(
-            "SELECT path_pattern FROM modules WHERE name = ?1",
-            [module_name],
-            |row| row.get(0)
-        );
-        
-        match result {
-            Ok(pattern) => Ok(Some(pattern)),
-            Err(_) => Ok(None),
-        }
     }
 
     pub fn get_rule_count(&self) -> Result<i64> {
@@ -624,15 +601,6 @@ impl Db {
             }
 
             if score > 0 {
-                // Get sample files (up to 5)
-                let mut file_stmt = conn.prepare(
-                    "SELECT file_path FROM file_map WHERE module_id = ?1 LIMIT 5"
-                )?;
-                let files: Vec<String> = file_stmt
-                    .query_map([id], |row| row.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
                 // Get rules
                 let mut rule_stmt = conn.prepare(
                     "SELECT rule_type, description, pattern FROM rules WHERE module_id = ?1"
@@ -667,18 +635,6 @@ impl Db {
         Ok(context)
     }
 
-    pub fn insert_symbol(&self, file_path: &str, symbol_type: &str, name: &str, signature: Option<&str>, line_number: i64, module_id: i64, exported: bool) -> Result<i64> {
-        let conn = self.lock();
-        let file_path = self.normalize(file_path);
-        let tx = conn.unchecked_transaction()?;
-        let result = tx.execute(
-            "INSERT INTO symbols (file_path, symbol_type, name, signature, line_number, module_id, exported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            (file_path, symbol_type, name, signature, line_number, module_id, exported as i32),
-        )?;
-        tx.commit()?;
-        Ok(result as i64)
-    }
-
     pub fn insert_symbols_batch(&self, symbols: &[Symbol]) -> Result<()> {
         let conn = self.lock();
         let tx = conn.unchecked_transaction()?;
@@ -690,19 +646,6 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
-    }
-
-    pub fn insert_import(&self, file_path: &str, imported_from: &str, imported_names: &[String], module_id: i64) -> Result<i64> {
-        let conn = self.lock();
-        let file_path = self.normalize(file_path);
-        let names_json = serde_json::to_string(imported_names).unwrap_or_else(|_| "[]".to_string());
-        let tx = conn.unchecked_transaction()?;
-        let result = tx.execute(
-            "INSERT INTO imports (file_path, imported_from, imported_names, module_id) VALUES (?1, ?2, ?3, ?4)",
-            (file_path, imported_from, names_json.as_str(), module_id),
-        )?;
-        tx.commit()?;
-        Ok(result as i64)
     }
 
     pub fn insert_imports_batch(&self, imports: &[Import]) -> Result<()> {
@@ -719,29 +662,9 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_symbols_by_module(&self, module_id: i64) -> Result<Vec<Symbol>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, file_path, symbol_type, name, signature, line_number, module_id, exported FROM symbols WHERE module_id = ?1"
-        )?;
-        let symbols = stmt.query_map([module_id], |row| {
-            let symbol_type_str: String = row.get(2)?;
-            Ok(Symbol {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                symbol_type: SymbolType::from(symbol_type_str),
-                name: row.get(3)?,
-                signature: row.get(4)?,
-                line_number: row.get(5)?,
-                module_id: row.get(6)?,
-                exported: row.get::<_, i32>(7)? != 0,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-        Ok(symbols)
-    }
-
+    /// Per-file symbol lookup: the substrate the Step 2 boundary engine reads.
+    /// No caller in the binary yet -- only the path-normalization tests.
+    #[allow(dead_code)]
     pub fn get_symbols_by_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
@@ -801,6 +724,8 @@ impl Db {
         Ok(results)
     }
 
+    /// Per-file import lookup: same substrate as `get_symbols_by_file`.
+    #[allow(dead_code)]
     pub fn get_imports_by_file(&self, file_path: &str) -> Result<Vec<Import>> {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
@@ -822,16 +747,6 @@ impl Db {
         .filter_map(|r| r.ok())
         .collect();
         Ok(imports)
-    }
-
-    pub fn get_symbol_count(&self) -> Result<i64> {
-        let conn = self.lock();
-        conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
-    }
-
-    pub fn get_import_count(&self) -> Result<i64> {
-        let conn = self.lock();
-        conn.query_row("SELECT COUNT(*) FROM imports", [], |row| row.get(0))
     }
 
     pub fn clear_file_symbols(&self, file_path: &str) -> Result<()> {
@@ -875,34 +790,6 @@ impl Db {
         })?
         .filter_map(|r| r.ok())
         .collect();
-
-        Ok(results)
-    }
-
-    pub fn get_forbidden_rules(&self, module_names: &[String]) -> Result<Vec<(String, String, String)>> {
-        let conn = self.lock();
-        if module_names.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut results = Vec::new();
-        
-        for name in module_names {
-            let query = "SELECT m.name, r.description, r.pattern FROM rules r 
-                        JOIN modules m ON r.module_id = m.id 
-                        WHERE r.rule_type = 'forbidden' AND m.name = ?1";
-            
-            let mut stmt = conn.prepare(query)?;
-            let rows = stmt.query_map([name.as_str()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            })?;
-            
-            for row in rows {
-                if let Ok(r) = row {
-                    results.push(r);
-                }
-            }
-        }
 
         Ok(results)
     }
@@ -1043,8 +930,18 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
+    /// SQLite has no journal for `:memory:`, so WAL is configured best-effort
+    /// here instead of through `Db::open`.
+    fn open_in_memory() -> Result<Db> {
+        let conn = Connection::open_in_memory()?;
+        Ok(Db {
+            conn: Arc::new(Mutex::new(conn)),
+            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        })
+    }
+
     fn mem_db() -> Db {
-        let db = Db::open_in_memory().expect("open in-memory");
+        let db = open_in_memory().expect("open in-memory");
         db.init_schema().expect("init schema");
         db
     }
@@ -1063,23 +960,25 @@ mod tests {
         .expect("insert rule");
         db.upsert_file("src/components/Button.tsx", module_id)
             .expect("upsert file");
-        db.insert_symbol(
-            "src/components/Button.tsx",
-            "function",
-            "Button",
-            Some("Button(): string"),
-            1,
+        db.insert_symbols_batch(&[Symbol {
+            id: 0,
+            file_path: "src/components/Button.tsx".to_string(),
+            symbol_type: SymbolType::Function,
+            name: "Button".to_string(),
+            signature: Some("Button(): string".to_string()),
+            line_number: 1,
             module_id,
-            true,
-        )
-        .expect("insert symbol");
-        db.insert_import(
-            "src/components/Button.tsx",
-            "@/db",
-            &["db".to_string()],
+            exported: true,
+        }])
+        .expect("insert symbols");
+        db.insert_imports_batch(&[Import {
+            id: 0,
+            file_path: "src/components/Button.tsx".to_string(),
+            imported_from: "@/db".to_string(),
+            imported_names: vec!["db".to_string()],
             module_id,
-        )
-        .expect("insert import");
+        }])
+        .expect("insert imports");
         db
     }
 
@@ -1195,10 +1094,19 @@ mod tests {
         let db = mem_db();
         let module_id = db.insert_module("components", "ui", "src/components/**").unwrap();
         db.upsert_file("./src/components/A.tsx", module_id).unwrap();
-        db.insert_symbol("./src/components/A.tsx", "function", "a", None, 1, module_id, false)
-            .unwrap();
+        db.insert_symbols_batch(&[Symbol {
+            id: 0,
+            file_path: "./src/components/A.tsx".to_string(),
+            symbol_type: SymbolType::Function,
+            name: "a".to_string(),
+            signature: None,
+            line_number: 1,
+            module_id,
+            exported: false,
+        }])
+        .unwrap();
         db.clear_file_symbols("src/components/A.tsx").unwrap();
-        assert_eq!(db.get_symbol_count().unwrap(), 0);
+        assert!(db.get_symbols_by_file("src/components/A.tsx").unwrap().is_empty());
         assert!(db
             .get_module_for_file("src/components/A.tsx")
             .unwrap()

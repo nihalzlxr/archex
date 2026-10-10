@@ -99,17 +99,17 @@ pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
             let module_id = db.get_module_id_by_name(&module)?
                 .ok_or_else(|| format!("Module '{}' not found", module))?;
             
-            let valid_type = match rule_type.to_lowercase().as_str() {
-                "forbidden" => RuleType::Forbidden,
-                "required" => RuleType::Required,
-                "warning" => RuleType::Warning,
+            // Validate, then store the canonical spelling -- not whatever the
+            // user typed, which the rules CHECK constraint would reject.
+            let normalized = rule_type.to_lowercase();
+            let rule_type = match normalized.as_str() {
+                t @ ("forbidden" | "required" | "warning") => t,
                 t => return Err(format!("Invalid rule type '{}'. Use: forbidden, required, warning", t).into()),
             };
-            
-            db.insert_rule(module_id, &rule_type, &description, pattern.as_deref())?;
-            
-            let count = db.get_rule_count()?;
-            println!("[OK] Rule added successfully (ID: {})", count);
+
+            let rule_id = db.insert_rule(module_id, rule_type, &description, pattern.as_deref())?;
+
+            println!("[OK] Rule added successfully (ID: {})", rule_id);
             println!("  Module: {}", module);
             println!("  Type: {}", rule_type);
             println!("  Description: {}", description);
