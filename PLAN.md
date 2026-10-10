@@ -86,31 +86,33 @@ absorbs it, which would leave a valid config with no layers at all), module
 names must be unique, and a module in an undeclared layer is an error rather
 than a module that quietly matches nothing.
 
-### rules/<id>.toml — one schema, three engines, `kind` selects
+### rules/<id>.toml — one schema, four engines, `kind` selects
+
+**This section is the authoritative rule schema.** §19 records where each
+field came from and what is still deferred; it does not define the schema.
 
 ```toml
 schema_version = 1
 id = "ui-no-db-import"
 status = "accepted"      # accepted | proposed | retired
-kind = "boundary"        # boundary | pattern | presence
+kind = "boundary"        # boundary | pattern | literal | presence
 severity = "error"       # error = CI exit 1 | warning = report only
 
 [boundary]
-from_layer = "ui"
-to_layer = "db"
-message = "UI must not import the db layer. Go through services."
-# [pattern]  → scope, mode (forbidden|required|warning), pattern, message
-# [presence] → applies_to, requires, message
-```
-
-```toml
-[boundary]                     # added in Step 2, and load-bearing
 from_layer = "ui"              # a LAYER name or a MODULE name
 to_layer = "db"
 allow_to = ["packages/engine/src/index.ts"]   # exempt targets
 include_tests = false          # opt back into test_globs
 exclude = ["src/legacy/**"]    # anything else to skip
+reachable = false              # transitive? NOT YET SUPPORTED — see below
 message = "UI must not import the db layer. Go through services."
+
+# [pattern]  → scope, mode (forbidden|required|warning), pattern, message
+#              pattern is REGEX-ONLY. An invalid regex is a validation error.
+# [literal]  → scope, message, literal. Exact, case-sensitive, and
+#              identifier-boundary aware: forbidding `legacy_client` must not
+#              fire on `legacy_client_v2`.
+# [presence] → applies_to, requires, message
 ```
 
 `allow_to` exists because a monorepo boundary is not a layer pair: reaching
@@ -123,11 +125,31 @@ that is BOTH is only ambiguous when the two readings cover different
 modules — `name = "engine", layer = "engine"` is accepted, because both
 readings name the same set and cannot change what the rule means.
 
+`pattern` and `literal` are split because one kind carrying two meanings is
+a trap: today `pattern` is regex-with-a-substring-fallback, so a typo'd
+regex silently degrades into a substring match and keeps passing CI. After
+the split, an invalid regex fails validation and `literal` is exact.
+
+**`reachable` is accepted only as `false`.** `reachable = true` must be
+REJECTED at validation with "not supported by this build" until the engine
+computes transitive closure. A field that is accepted and silently does
+nothing is the worst outcome available: a human writes "ui must not import
+db, directly or via anything", gets direct-only enforcement, and the rule
+reads as if it were transitive. That is the silently-empty-rule failure this
+design exists to prevent, arriving through the front door.
+
 Validator rule: `kind` must match exactly one engine table. Rules are
 human-authored in v1; agents may only *suggest* one inside a decision.
 Rules live in FILES, never in the database: plain text in git is the source
 of truth (§2.5), and a rule that exists only in a local index enforces
 nothing on anyone else's machine.
+
+**Deferred, and this section is not yet complete:** import classification
+(§19.4). A boundary rule must be able to say whether `import type` edges
+count, because type-only imports cannot create runtime coupling but are
+still compile-time coupling, and the choice is the human's. Measured on
+LORB, type-only edges are 713 of 10,638 — 6.7% of the graph — so the
+default matters more than usual.
 
 ### decisions/<ULID>-<slug>.md — markdown + frontmatter
 
@@ -229,7 +251,7 @@ File-level resolved imports first. **The hard part is TypeScript** — `tsconfig
 | **0** | Truthful core: idempotent init, symbol dedup (`clear_file_symbols` wired), shared case-correct regex helper, `exported` + signature extraction fixes, WAL + one shared connection, path normalization, dead code deleted, generic module seeding, **fixture tests + full suite** | `init` twice clean; suite green | ✅ done — 176 tests, zero warnings |
 | **1** | **Eval harness**: ~20 real LORB commits, ground truth = files each commit touched; Hit@3, MRR, function accuracy; baselines = plain grep + current archex | Numbers recorded | ✅ done — see below. Run on `project/fitness`; LORB reserved for Step 2 (below) |
 | **2** | **The Gate**: file-level import resolution, rules as data, `archex check` + CI job, baseline mode | ≥1 real violation caught on LORB; **zero false positives on a clean tree** | ✅ done — both halves, on LORB |
-| **2.5** | **One source of truth for rules.** Gate, `check --file-path` and MCP `check_drift` load `.archex/rules/*.toml` through **one loader and one engine**. `rule add` writes a validated file through the real validator (canonical serialization; flags grow `--from --to --allow-to --severity`, or boundary rules stay CLI-unreachable); `rule remove` **retires** by default (`status = "retired"`), `--purge` deletes; `archex rule migrate` converts DB rules — refusing any whose module has no layer in `config.toml` — then the `rules` table dies at the next schema bump. Legacy DB rules warn once on startup, then migrate | The same fixture run through the CI path and the per-file advisory path produces **identical findings** — advisory and gate must never disagree, or agents learn to distrust the advisory | ⬜ next — full approach in `RESUME.md` |
+| **2.5** | **One source of truth for rules.** Gate, `check --file-path` and MCP `check_drift` load `.archex/rules/*.toml` through **one loader and one engine**. `rule add` writes a validated file through the real validator (canonical serialization; flags grow `--from --to --allow-to --severity`, or boundary rules stay CLI-unreachable); `rule remove` **retires** by default (`status = "retired"`), `--purge` deletes; `archex rule migrate` converts DB rules — refusing any whose module has no layer in `config.toml` — then the `rules` table dies at the next schema bump. Legacy DB rules warn once on startup, then migrate | **The per-file advisory result for file X equals the gate's findings filtered to X** — measured on a fixture where X contains at least one violation, so the assertion cannot pass vacuously. Advisory and gate must never disagree, or agents learn to distrust the advisory | ⬜ next — full approach in `RESUME.md` |
 | **3** | **The Ledger**: file formats + validator, `archex sync`, brief injection, `decide` CLI, `record_decision` MCP tool | An agent logs a decision mid-session; the next session starts knowing it | ⬜ not started |
 | **4** | Retrieval surface: FTS5 word-split search, `search`/`traverse`/`read` with token budgets, stable ordering | Measurable gain over the Step 1 baseline | ⬜ not started |
 | **5** | Conditional: symbol edges, PageRank repo map | Only if Step 4 leaves retrieval as the proven bottleneck | ⬜ not started |
@@ -429,15 +451,26 @@ Steals with sources. Each is small now, expensive after Step 3+.
    the file that declares it. Our rule TOMLs carry pattern text in `message`;
    the engine must not scan `.archex/` anyway — make both explicit in the
    engine spec.
-3. **`reachable = false` on `[boundary]`** (dependency-cruiser): schema field
-   now, engine later — "ui must not import db, directly or via anything."
-   Direct-edge-only is a toy gate; services-layer laundering defeats it.
-   Default `false` keeps Step 2 semantics unchanged.
+3. **`reachable = false` on `[boundary]`** (dependency-cruiser): the field
+   is in the schema (§5), default `false`, so Step 2 semantics are
+   unchanged — but **`reachable = true` is rejected at validation until the
+   engine exists.** Direct-edge-only is a toy gate (services-layer laundering
+   defeats it), so the field is wanted; accepting `true` and ignoring it is
+   worse than not having it, because the rule then reads as transitive while
+   enforcing nothing transitive. Needs transitive closure over resolved
+   edges with cycle guards — a real algorithm, not a flag.
 4. **Import classification: 5 kinds** — `relative | aliased | package |
    type-only | dynamic`, everything else unclassified (dependency-cruiser has
-   25; we take the 5 that matter). The killer detail: **`import type` is
-   exempt from boundary rules** — type-only imports cannot create runtime
-   coupling, and counting them is a false-positive generator.
+   25; we take the 5 that matter). The killer detail: **`import type` edges
+   are treated differently by default.** Measured on LORB, type-only imports
+   are 713 of 10,638 edges — 6.7% of the graph — and today they are
+   indistinguishable from value imports, so any internals rule flags up to
+   713 false violations. Type-only imports cannot create runtime coupling,
+   which is a fact; that they should therefore be *exempt* is a policy
+   choice, because compile-time coupling is still coupling. So it is
+   per-rule (`include_type_only`, default `true` = skip, precision-first),
+   not a hardcoded exemption — see §5. dependency-cruiser's model is the
+   same shape: a kind you can forbid or allow, never a blanket skip.
 5. **Future, post-Step-3** (steal list): `archex init --import` — absorb
    existing CLAUDE.md/AGENTS.md/rules into decisions (Archcore proves
    demand); `archex status` coverage report — which decisions are

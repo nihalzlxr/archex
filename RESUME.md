@@ -55,10 +55,12 @@ prevent; leaving it (option 2) is a trap where `rule add` appears to work
 and enforces nothing.
 
 1. **One loader, every path.** Gate, `check --file-path` and MCP
-   `check_drift` load through the same function and run the same engine. Add
-   a test that runs one fixture through the CI path and the per-file
-   advisory path and asserts identical findings. Advisory and gate must
-   never disagree, or agents learn to distrust the advisory.
+   `check_drift` load through the same function and run the same engine.
+   The exit test: the per-file advisory result **for file X** equals the
+   gate's findings **filtered to X**, measured on a fixture where X
+   contains at least one violation — so the assertion cannot pass
+   vacuously. Advisory and gate must never disagree, or agents learn to
+   distrust the advisory.
 2. **`rule add` writes a file through the real validator.** Slug id, refuse
    to overwrite, full validation before writing, canonical serialization
    (sorted keys, fixed line endings) so diffs stay small. An invalid rule
