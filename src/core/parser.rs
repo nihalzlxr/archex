@@ -242,58 +242,8 @@ impl Parser {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = Self::get_node_text(&name_node, content);
                     
-                    // Find parameters and return type by searching all children recursively
-                    let mut params_text: String = String::new();
-                    let mut return_type: String = String::new();
-                    
-                    fn search_tree(n: &tree_sitter::Node, content: &str, p: &mut String, r: &mut String) {
-                        let kn = n.kind();
-                        
-                        if kn == "formal_parameters" || kn == "required_parameters" || kn == "parameters" {
-                            if p.is_empty() {
-                                *p = n.utf8_text(content.as_bytes()).unwrap_or_default().to_string();
-                            }
-                        }
-                        
-                        if kn == "type_annotation" {
-                            let text = n.utf8_text(content.as_bytes()).unwrap_or_default();
-                            if text.starts_with(": ") {
-                                *r = text[2..].to_string();
-                            } else if text.starts_with(':') && !text.contains(')') {
-                                *r = text[1..].to_string();
-                            }
-                        }
-                        
-                        for i in 0..n.child_count() {
-                            if let Some(ch) = n.child(i) {
-                                let ch_ref = &ch;
-                                search_tree(ch_ref, content, p, r);
-                            }
-                        }
-                    }
-                    
-                    let node_ref = node;
-                    search_tree(node_ref, content, &mut params_text, &mut return_type);
-                    
-                    // Clean up params_text - remove outer parens if present
-                    let params_text = params_text.trim().to_string();
-                    let params_clean = if params_text.starts_with('(') && params_text.ends_with(')') {
-                        params_text[1..params_text.len()-1].to_string()
-                    } else {
-                        params_text.clone()
-                    };
-                    
-                    // Clean up return_type - remove leading ": " if present
-                    let return_type = return_type.trim().to_string();
-                    let return_type = return_type.trim_start_matches(": ").to_string();
-                    
-                    // Build signature with clean params
-                    let signature = if return_type.is_empty() {
-                        format!("{}({})", name, params_clean)
-                    } else {
-                        format!("{}({}): {}", name, params_clean, return_type)
-                    };
-                    
+                    let signature = Self::ts_function_signature(&name, node, content);
+
                     let line = node.start_position().row as i64 + 1;
                     
                     let symbol_type = if is_route_file { "route" } else { "function" };
@@ -357,6 +307,39 @@ impl Parser {
                         symbol_type: SymbolType::Enum,
                         name,
                         signature: None,
+                        line_number: line,
+                        module_id,
+                        exported: Self::is_exported(node, content),
+                    });
+                }
+            }
+"lexical_declaration" | "variable_declaration" => {
+                for i in 0..node.child_count() {
+                    let Some(declarator) = node.child(i) else { continue };
+                    if declarator.kind() != "variable_declarator" { continue; }
+
+                    let (Some(name_node), Some(value)) = (
+                        declarator.child_by_field_name("name"),
+                        declarator.child_by_field_name("value"),
+                    ) else { continue };
+
+                    if !matches!(
+                        value.kind(),
+                        "arrow_function" | "function_expression" | "function" | "generator_function"
+                    ) {
+                        continue;
+                    }
+
+                    let name = Self::get_node_text(&name_node, content);
+                    let signature = Self::ts_function_signature(&name, &value, content);
+                    let line = declarator.start_position().row as i64 + 1;
+
+                    symbols.push(Symbol {
+                        id: 0,
+                        file_path: file_path.to_string(),
+                        symbol_type: if is_route_file { SymbolType::Route } else { SymbolType::Function },
+                        name,
+                        signature: Some(signature),
                         line_number: line,
                         module_id,
                         exported: Self::is_exported(node, content),
@@ -969,22 +952,112 @@ if kind == "default_import" {
         )
     }
 
-    fn is_exported(node: &tree_sitter::Node, _content: &str) -> bool {
-        if let Some(prev) = node.prev_sibling() {
-            let kind = prev.kind();
-            kind == "export_statement" || kind == "declare_export_statement"
+    /// Build `name(params): return_type` from tree-sitter fields only.
+    /// Field lookups, never subtree search: a body-local `: SomeType` must
+    /// never be mistaken for the declared return type.
+    fn ts_function_signature(name: &str, node: &tree_sitter::Node, content: &str) -> String {
+        let params_text = node
+            .child_by_field_name("parameters")
+            .map(|p| Self::get_node_text(&p, content))
+            .unwrap_or_default();
+        let params_text = params_text.trim();
+        let params = params_text
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(params_text);
+
+        let mut return_type = node
+            .child_by_field_name("return_type")
+            .map(|r| Self::get_node_text(&r, content))
+            .map(|t| t.trim().trim_start_matches(':').trim().to_string())
+            .unwrap_or_default();
+
+        if return_type.is_empty() {
+            if let Some(body) = node.child_by_field_name("body") {
+                return_type = Self::literal_type(&body).to_string();
+            }
+        }
+
+        if return_type.is_empty() {
+            format!("{}({})", name, params)
         } else {
-            false
+            format!("{}({}): {}", name, params, return_type)
         }
     }
 
-    fn is_python_exported(node: &tree_sitter::Node, _content: &str) -> bool {
-        if let Some(prev) = node.prev_sibling() {
-            let kind = prev.kind();
-            kind == "future_import_statement"
-        } else {
-            false
+    /// Return type of a body that is a bare literal — the only case where we
+    /// can state the type without reading a type annotation. Empty otherwise:
+    /// precision over recall.
+    fn literal_type(body: &tree_sitter::Node) -> &'static str {
+        match body.kind() {
+            "number" => "number",
+            "string" | "template_string" => "string",
+            "true" | "false" => "boolean",
+            "null" => "null",
+            "undefined" => "undefined",
+            _ => "",
         }
+    }
+
+    /// A declaration is exported when it is wrapped in an `export_statement`,
+    /// i.e. its PARENT is the export — `export function f() {}` parses as an
+    /// export_statement whose `declaration` child is the function, never as a
+    /// sibling. Also honours explicit `export { a, b }` clauses.
+    fn is_exported(node: &tree_sitter::Node, content: &str) -> bool {
+        let Some(parent) = node.parent() else { return false };
+        if parent.kind() != "export_statement" && parent.kind() != "declare_export_statement" {
+            return false;
+        }
+        // `export { a, b }` — the declaration is NOT a child, so match by name.
+        let Some(clause) = Self::find_export_clause(&parent) else {
+            return true;
+        };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return true;
+        };
+        let name = Self::get_node_text(&name_node, content);
+        Self::export_clause_names(&clause, content).iter().any(|n| *n == name)
+    }
+
+    fn find_export_clause<'a>(stmt: &'a tree_sitter::Node) -> Option<tree_sitter::Node<'a>> {
+        (0..stmt.named_child_count())
+            .filter_map(|i| stmt.named_child(i))
+            .find(|c| matches!(c.kind(), "export_clause" | "named_exports"))
+    }
+
+    fn export_clause_names(clause: &tree_sitter::Node, content: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for i in 0..clause.named_child_count() {
+            let Some(child) = clause.named_child(i) else { continue };
+            if matches!(child.kind(), "identifier" | "string" | "export_specifier") {
+                let text = Self::get_node_text(&child, content);
+                let name = text.rsplit(" as ").next().unwrap_or(&text).trim().to_string();
+                if !name.is_empty() {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// Python has no `export`: a top-level name not starting with `_` is
+    /// public. Nesting (methods, closures) or a leading underscore makes it
+    /// private. Decorators wrap the definition in `decorated_definition`.
+    fn is_python_exported(node: &tree_sitter::Node, content: &str) -> bool {
+        let Some(name_node) = node.child_by_field_name("name") else { return false };
+        let name = Self::get_node_text(&name_node, content);
+        if name.starts_with('_') {
+            return false;
+        }
+        let mut current = *node;
+        while let Some(parent) = current.parent() {
+            match parent.kind() {
+                "module" => return true,
+                "decorated_definition" => current = parent,
+                _ => return false,
+            }
+        }
+        false
     }
 
     pub fn check_drift(file_path: &str, content: &str) -> DriftResult {
@@ -1112,5 +1185,141 @@ if kind == "default_import" {
             violations,
             clean,
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(content: &str) -> Vec<Symbol> {
+        Parser::extract_ts_symbols("src/a.ts", 1, content, Path::new("src/a.ts")).0
+    }
+
+    fn py(content: &str) -> Vec<Symbol> {
+        Parser::extract_python_symbols("a.py", 1, content).0
+    }
+
+    fn get<'a>(syms: &'a [Symbol], name: &str) -> &'a Symbol {
+        syms.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol `{}` not extracted. got: {:?}", name, syms.iter().map(|s| s.name.clone()).collect::<Vec<_>>()))
+    }
+
+    fn sig(syms: &[Symbol], name: &str) -> String {
+        get(syms, name).signature.clone().unwrap_or_default()
+    }
+
+    // --- exported: TS ---
+
+    #[test]
+    fn ts_export_function_is_exported() {
+        let s = ts("export function alpha() {}\n");
+        assert!(get(&s, "alpha").exported);
+    }
+
+    #[test]
+    fn ts_plain_function_is_not_exported() {
+        let s = ts("function alpha() {}\n");
+        assert!(!get(&s, "alpha").exported);
+    }
+
+    #[test]
+    fn ts_export_default_function_is_exported() {
+        let s = ts("export default function alpha() {}\n");
+        assert!(get(&s, "alpha").exported);
+    }
+
+    #[test]
+    fn ts_export_class_interface_type_enum_are_exported() {
+        let s = ts(
+            "export class A {}\nexport interface B {}\nexport type C = number;\nexport enum D { X }\n",
+        );
+        for n in ["A", "B", "C", "D"] {
+            assert!(get(&s, n).exported, "{} should be exported", n);
+        }
+    }
+
+    #[test]
+    fn ts_non_exported_class_interface_enum_are_not_exported() {
+        let s = ts("class A {}\ninterface B {}\nenum D { X }\ntype C = number;\n");
+        for n in ["A", "B", "C", "D"] {
+            assert!(!get(&s, n).exported, "{} should not be exported", n);
+        }
+    }
+
+    // --- signatures: TS ---
+
+    #[test]
+    fn ts_signature_ignores_types_from_function_body() {
+        let s = ts(
+            "export function alpha(a: string): Promise<void> {\n  const x: SecretType = a as any;\n  return;\n}\n",
+        );
+        assert_eq!(sig(&s, "alpha"), "alpha(a: string): Promise<void>");
+    }
+
+    #[test]
+    fn ts_signature_without_return_type() {
+        let s = ts("export function alpha(a: string, b: number) {\n  const x: Inner = 1;\n}\n");
+        assert_eq!(sig(&s, "alpha"), "alpha(a: string, b: number)");
+    }
+
+    #[test]
+    fn ts_arrow_function_symbol_and_signature() {
+        let s = ts("export const alpha = (a: string): Promise<void> => {\n  const y: Inner = 1;\n};\n");
+        assert_eq!(sig(&s, "alpha"), "alpha(a: string): Promise<void>");
+        assert!(get(&s, "alpha").exported);
+    }
+
+    #[test]
+    fn ts_arrow_function_without_params() {
+        let s = ts("export const alpha = () => 1;\n");
+        assert_eq!(sig(&s, "alpha"), "alpha(): number");
+        assert!(get(&s, "alpha").exported);
+    }
+
+    #[test]
+    fn ts_non_exported_arrow_function() {
+        let s = ts("const alpha = () => 1;\n");
+        assert!(!get(&s, "alpha").exported);
+    }
+
+    #[test]
+    fn ts_function_expression_variable() {
+        let s = ts("export const alpha = function (a: number): string { return ''; };\n");
+        assert_eq!(sig(&s, "alpha"), "alpha(a: number): string");
+    }
+
+    // --- exported: Python ---
+
+    #[test]
+    fn python_module_level_def_is_exported() {
+        let s = py("def alpha():\n    pass\n");
+        assert!(get(&s, "alpha").exported);
+    }
+
+    #[test]
+    fn python_underscore_def_is_private() {
+        let s = py("def _alpha():\n    pass\n");
+        assert!(!get(&s, "_alpha").exported);
+    }
+
+    #[test]
+    fn python_nested_def_is_not_exported() {
+        let s = py("def outer():\n    def alpha():\n        pass\n");
+        assert!(!get(&s, "alpha").exported);
+        assert!(get(&s, "outer").exported);
+    }
+
+    #[test]
+    fn python_class_method_is_not_exported() {
+        let s = py("class A:\n    def alpha(self):\n        pass\n");
+        assert!(!get(&s, "alpha").exported);
+        assert!(get(&s, "A").exported);
+    }
+
+    #[test]
+    fn python_decorated_def_is_exported() {
+        let s = py("@deco\ndef alpha():\n    pass\n");
+        assert!(get(&s, "alpha").exported);
     }
 }
