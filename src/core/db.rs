@@ -884,3 +884,230 @@ pub struct SymbolSearchResult {
     pub module_name: String,
     pub symbol_type: SymbolType,
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Arc;
+
+    fn mem_db() -> Db {
+        let db = Db::open_in_memory().expect("open in-memory");
+        db.init_schema().expect("init schema");
+        db
+    }
+
+    fn seeded() -> Db {
+        let db = mem_db();
+        let module_id = db
+            .insert_module("components", "ui", "src/components/**")
+            .expect("insert module");
+        db.insert_rule(
+            module_id,
+            "forbidden",
+            "ui must not import db",
+            Some("from ['\"]@/db"),
+        )
+        .expect("insert rule");
+        db.upsert_file("src/components/Button.tsx", module_id)
+            .expect("upsert file");
+        db.insert_symbol(
+            "src/components/Button.tsx",
+            "function",
+            "Button",
+            Some("Button(): string"),
+            1,
+            module_id,
+            true,
+        )
+        .expect("insert symbol");
+        db.insert_import(
+            "src/components/Button.tsx",
+            "@/db",
+            &["db".to_string()],
+            module_id,
+        )
+        .expect("insert import");
+        db
+    }
+
+    fn abs(cwd_relative: &str) -> String {
+        std::env::current_dir()
+            .unwrap()
+            .join(cwd_relative)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn pragma(db: &Db, name: &str) -> String {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(&format!("PRAGMA {}", name), [], |r| r.get::<_, String>(0))
+            .unwrap()
+    }
+
+    // --- path normalization on lookup ---
+
+    #[test]
+    fn context_lookup_accepts_absolute_path() {
+        let db = seeded();
+        assert!(db
+            .get_context_for_file(&abs("src/components/Button.tsx"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn context_lookup_accepts_dot_slash_prefix() {
+        let db = seeded();
+        assert!(db
+            .get_context_for_file("./src/components/Button.tsx")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn context_lookup_accepts_backslashes() {
+        let db = seeded();
+        assert!(db
+            .get_context_for_file("src\\components\\Button.tsx")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn context_lookup_accepts_parent_segments() {
+        let db = seeded();
+        assert!(db
+            .get_context_for_file("src/db/../components/Button.tsx")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn module_for_file_accepts_absolute_path() {
+        let db = seeded();
+        let hit = db
+            .get_module_for_file(&abs("src/components/Button.tsx"))
+            .unwrap();
+        assert_eq!(hit.map(|(name, _)| name), Some("components".to_string()));
+    }
+
+    #[test]
+    fn symbols_by_file_accept_absolute_path() {
+        let db = seeded();
+        let syms = db
+            .get_symbols_by_file(&abs("src/components/Button.tsx"))
+            .unwrap();
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Button");
+    }
+
+    #[test]
+    fn imports_by_file_accept_absolute_path() {
+        let db = seeded();
+        let imports = db
+            .get_imports_by_file(&abs("src/components/Button.tsx"))
+            .unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].imported_from, "@/db");
+    }
+
+    #[test]
+    fn symbols_by_file_returns_empty_for_unindexed_file() {
+        let db = seeded();
+        assert!(db
+            .get_symbols_by_file("src/components/Nope.tsx")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn context_lookup_is_case_insensitive_on_case_insensitive_fs() {
+        let db = seeded();
+        assert!(db
+            .get_context_for_file("SRC/Components/Button.tsx")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn upsert_and_clear_use_the_same_normalized_path() {
+        let db = mem_db();
+        let module_id = db.insert_module("components", "ui", "src/components/**").unwrap();
+        db.upsert_file("./src/components/A.tsx", module_id).unwrap();
+        db.insert_symbol("./src/components/A.tsx", "function", "a", None, 1, module_id, false)
+            .unwrap();
+        db.clear_file_symbols("src/components/A.tsx").unwrap();
+        assert_eq!(db.get_symbol_count().unwrap(), 0);
+        assert!(db
+            .get_module_for_file("src/components/A.tsx")
+            .unwrap()
+            .is_some());
+    }
+
+    // --- WAL + pragmas ---
+
+    #[test]
+    fn open_enables_wal_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".archex").join("archex.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Db::open(&path).unwrap();
+        assert_eq!(pragma(&db, "journal_mode").to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn open_enables_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".archex").join("archex.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Db::open(&path).unwrap();
+        assert_eq!(pragma(&db, "foreign_keys"), "1");
+    }
+
+    #[test]
+    fn open_sets_a_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".archex").join("archex.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Db::open(&path).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(timeout > 0);
+    }
+
+    // --- shared connection ---
+
+    #[test]
+    fn shared_returns_one_instance_per_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        let one = Db::shared(&a).unwrap();
+        let again = Db::shared(&a).unwrap();
+        let other = Db::shared(&b).unwrap();
+        assert!(Arc::ptr_eq(&one, &again), "same path must reuse one connection");
+        assert!(!Arc::ptr_eq(&one, &other), "different paths must not share");
+    }
+
+    #[test]
+    fn shared_instance_survives_writes_from_both_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let one = Db::shared(&path).unwrap();
+        let again = Db::shared(&path).unwrap();
+        one.init_schema().unwrap();
+        again.init_schema().unwrap();
+        one.insert_module("components", "ui", "src/components/**").unwrap();
+        assert_eq!(again.get_rule_count().unwrap(), 0);
+        assert_eq!(again.get_all_modules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn db_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Db>();
+    }
+}
