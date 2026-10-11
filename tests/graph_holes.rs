@@ -7,6 +7,15 @@ mod common;
 
 use common::{init, two_layer_fixture};
 
+/// Every symbol name archex stored for this repo. The index is the only
+/// place the parser's extraction decisions are observable.
+fn archex_db_symbols(root: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join(".archex/archex.db")).unwrap();
+    let mut stmt = conn.prepare("SELECT name FROM symbols").unwrap();
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
 fn check(root: &Path) -> String {
     let out = Command::cargo_bin("archex")
         .unwrap()
