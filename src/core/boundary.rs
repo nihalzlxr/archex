@@ -292,7 +292,7 @@ fn collect_edges(db: &Db) -> Result<(Vec<Edge>, Coverage), ConfigError> {
                 // Calling that a gap would bury the first-party ones under
                 // a hundred lines of npm, and calling a scoped specifier
                 // either way would be a guess.
-                match specifier_home(&import.imported_from) {
+                match specifier_home(import.kind, &import.imported_from) {
                     SpecifierHome::External => coverage.external_packages += 1,
                     SpecifierHome::FirstParty => {
                         coverage.unresolved_imports += 1;
@@ -424,7 +424,21 @@ enum SpecifierHome {
     Ambiguous,
 }
 
-fn specifier_home(specifier: &str) -> SpecifierHome {
+/// Where an unresolved specifier points, by shape alone.
+///
+/// The parser's `kind` wins when it knows the answer — it saw the actual
+/// syntax (`./`, `../`, and Rust's `crate::`), so a `crate::db::pool` edge is
+/// first-party even though it looks like a bare package name. Shape is only
+/// consulted where the syntax is genuinely ambiguous, which is what the
+/// `type_only` and `dynamic` kinds mean: they wrap a specifier whose shape
+/// must then be read directly.
+fn specifier_home(kind: ImportKind, specifier: &str) -> SpecifierHome {
+    match kind {
+        ImportKind::Relative => return SpecifierHome::FirstParty,
+        ImportKind::Package => return SpecifierHome::External,
+        _ => {}
+    }
+
     let trimmed = specifier.trim();
     if trimmed.is_empty() {
         return SpecifierHome::Ambiguous;
@@ -435,6 +449,9 @@ fn specifier_home(specifier: &str) -> SpecifierHome {
         || trimmed.starts_with("@/")
         || trimmed.starts_with("~/")
         || trimmed.starts_with('#')
+        || trimmed.starts_with("crate::")
+        || trimmed.starts_with("self::")
+        || trimmed.starts_with("super::")
     {
         return SpecifierHome::FirstParty;
     }

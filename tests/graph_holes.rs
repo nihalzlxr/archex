@@ -20,6 +20,14 @@ fn archex_db_rows(root: &Path) -> Vec<String> {
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// Every symbol name archex stored for this repo.
+fn archex_db_symbols(root: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join(".archex/archex.db")).unwrap();
+    let mut stmt = conn.prepare("SELECT name FROM symbols").unwrap();
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
 fn check(root: &Path) -> String {
     let out = Command::cargo_bin("archex")
         .unwrap()
@@ -286,7 +294,7 @@ fn a_rust_import_survives_the_index() {
 
     fs::write(
         root.join("src/db/client.rs"),
-        "use serde::Serialize;\n\npub fn connect() -> i32 { 0 }\n",
+        "use serde::Serialize;\nuse crate::db::pool;\n\npub fn connect() -> i32 { 0 }\n",
     )
     .unwrap();
 
@@ -294,8 +302,14 @@ fn a_rust_import_survives_the_index() {
     let out = check(root);
 
     assert!(
+        out.contains("1 external package import(s)"),
+        "an external crate must reach the index, got:\n{}",
+        out
+    );
+    assert!(
         out.contains("1 unresolved first-party import(s)"),
-        "a Rust use statement must reach the index as an unclassified edge, got:\n{}",
+        "a `crate::` path is first-party and unresolvable here, so it is \
+         unclassified — counted, never a violation. Got:\n{}",
         out
     );
 }
@@ -330,18 +344,14 @@ export function Third() {
 
     init(root);
 
-    let found = call_mcp_tool(
-        root,
-        "find_similar",
-        &format!(r#"{{"description":"{}"}}"#, "Third"),
-    );
+    let indexed = archex_db_symbols(&root);
     for symbol in ["First", "Second", "Third"] {
         assert!(
-            found.contains(symbol),
+            indexed.iter().any(|name| name == symbol),
             "a function declared in a .tsx file must be indexed, {} was lost. \
-             Full response:\n{}",
+             Indexed: {:?}",
             symbol,
-            found
+            indexed
         );
     }
 }

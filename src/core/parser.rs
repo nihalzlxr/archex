@@ -168,7 +168,7 @@ impl Parser {
 
         let (symbols, mut imports) = match ext {
             "ts" | "tsx" | "js" | "jsx" => {
-                Self::extract_ts_symbols(file_path, module_id, content, path)
+                Self::extract_ts_symbols(file_path, module_id, content, ext)
             }
             "rs" => {
                 Self::extract_rust_symbols(file_path, module_id, content)
@@ -178,6 +178,23 @@ impl Parser {
             }
             _ => (Vec::new(), Vec::new()),
         };
+
+        // Every import leaves here knowing which file it came from and which
+        // module owns it — set in ONE place, on every collector's output.
+        //
+        // The Rust and Python collectors build their `Import` with
+        // `module_id: 0` and an empty `file_path` because they do not receive
+        // those values. The imports table has a foreign key on module_id,
+        // module ids start at 1, so the whole per-file batch failed — the
+        // error was discarded with `.ok()`, and `init` still counted the
+        // imports as extracted. Python and Rust repositories contributed
+        // zero edges and zero coverage while reporting work done.
+        //
+        // Normalizing here means the next collector cannot reintroduce it.
+        for import in imports.iter_mut() {
+            import.file_path = file_path.to_string();
+            import.module_id = module_id;
+        }
 
         // Resolve after extraction rather than threading a resolver through
         // every collector: the specifier is all that is needed, and one pass
@@ -194,17 +211,27 @@ impl Parser {
         file_path: &str,
         module_id: i64,
         content: &str,
-        path: &Path,
+        ext: &str,
     ) -> (Vec<Symbol>, Vec<Import>) {
         let mut symbols = Vec::new();
         let mut imports = Vec::new();
 
-        let is_route_file = Self::is_route_file(path);
+        // The repo-relative path decides what a file is. The absolute one
+        // carries whatever directories exist above the repository, and a
+        // checkout under `~/app/lorb` must not make every file a route.
+        let is_route_file = Self::is_route_file(file_path);
 
         let mut parser = tree_sitter::Parser::new();
-        let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
+        // JSX needs its own grammar. `LANGUAGE_TYPESCRIPT` has no JSX node
+        // types at all, so error recovery produced a malformed tree and
+        // symbols next to JSX were silently dropped — in the one file class
+        // that matters most for a React codebase.
+        let language = match ext {
+            "tsx" | "jsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            _ => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        };
         
-        if parser.set_language(&language.into()).is_ok() {
+        if parser.set_language(&language).is_ok() {
             if let Some(tree) = parser.parse(content, None) {
                 let root_node = tree.root_node();
                 Self::collect_ts_symbols(&root_node, content, file_path, module_id, is_route_file, &mut symbols, &mut imports);
@@ -657,8 +684,11 @@ if kind == "default_import" {
         let mut imported_from = String::new();
         let mut imported_names = Vec::new();
         
-        if let Some(tree) = node.child_by_field_name("tree") {
-            let text = Self::get_node_text(&tree, content);
+        // The grammar calls this field `argument`. Asking for `tree` returns
+        // None, so every `use` declaration was silently dropped before it
+        // ever reached the database — the FK bug was hiding behind it.
+        if let Some(argument) = node.child_by_field_name("argument") {
+            let text = Self::get_node_text(&argument, content);
             if let Some(path) = text.split_whitespace().last() {
                 imported_from = path.to_string();
                 
@@ -873,16 +903,34 @@ if kind == "default_import" {
         format!("({})", parts.join(", "))
     }
 
-    fn is_route_file(path: &Path) -> bool {
-        let path_str = path.to_string_lossy().to_lowercase();
-        path_str.contains("/app/api/") || 
-        path_str.contains("/pages/api/") || 
-        path_str.contains("/app/") && (
-            path_str.contains("page.ts") || 
-            path_str.contains("page.tsx") ||
-            path_str.contains("route.ts") ||
-            path_str.contains("route.tsx")
-        )
+/// A route file is named `page.*` or `route.*` inside an `app/` or
+    /// `pages/` directory — by the file's OWN repo-relative path.
+    ///
+    /// Two bugs lived here. It used to read the absolute path, so a
+    /// checkout under `~/app/lorb` made every file in the repository a
+    /// route. And `&&` binds tighter than `||`, so `/app/api/` matched on
+    /// its own and every helper sitting next to a route file became one.
+    fn is_route_file(relative_path: &str) -> bool {
+        let path = relative_path.to_lowercase();
+        let in_app = path.contains("/app/") || path.starts_with("app/");
+        let in_pages = path.contains("/pages/") || path.starts_with("pages/");
+        if !in_app && !in_pages {
+            return false;
+        }
+        // The two routers disagree, and so must this: the pages router maps
+        // every file under `pages/` to a route, while the app router only
+        // treats `page.*` and `route.*` as entrypoints. A helper sitting
+        // next to a route file is not one — that mistake is why the old
+        // `/app/api/` clause had to go.
+        if in_pages {
+            return true;
+        }
+        [
+            "page.ts", "page.tsx", "page.js", "page.jsx", "route.ts", "route.tsx", "route.js",
+            "route.jsx",
+        ]
+        .iter()
+        .any(|name| path.ends_with(name))
     }
 
     /// Build `name(params): return_type` from tree-sitter fields only.
@@ -1158,22 +1206,23 @@ mod tests {
         }
     }
 
-    /// Defect 3: `is_route_file` was handed the ABSOLUTE path, so a repo
-    /// living under any `app/` directory had ordinary files retyped as
-    /// routes. The `&&`/`||` precedence made it worse: `/app/api/` matched
-    /// on its own, ignoring the filename clause, so every helper under an
-    /// api directory became a route.
+    /// Defect 3: `is_route_file` now takes the repo-relative path. The old
+    /// one took the absolute path, so a checkout under `~/app/lorb` made
+    /// every file in the repository a route file.
     #[test]
-    fn a_path_above_the_repo_root_cannot_decide_what_a_file_is() {
-        // A repo that happens to live under /app/ — the shape that produced
-        // bogus route symbols. Nothing in `src/lib` is a route file.
-        assert!(
-            !Parser::is_route_file(std::path::Path::new(
-                "/home/dev/app/lorb/src/lib/page.ts"
-            )),
-            "a file outside src/app cannot become a route because of where \
-             the repository lives"
-        );
+    fn only_the_repo_relative_path_decides_what_a_file_is() {
+        for path in [
+            "src/lib/page.ts",
+            "src/lib/utils.ts",
+            "packages/core/src/index.ts",
+            "app/lib/helpers.ts",
+        ] {
+            assert!(
+                !Parser::is_route_file(path),
+                "{} is not a route file",
+                path
+            );
+        }
     }
 
     #[test]
@@ -1183,12 +1232,9 @@ mod tests {
             "src/app/api/route.tsx",
             "src/app/dashboard/page.tsx",
             "src/pages/api/users.ts",
+            "src/pages/index.tsx",
         ] {
-            assert!(
-                Parser::is_route_file(std::path::Path::new(path)),
-                "{} is a route file",
-                path
-            );
+            assert!(Parser::is_route_file(path), "{} is a route file", path);
         }
 
         // The precedence bug: `/app/api/` matched on its own, so a plain
@@ -1199,7 +1245,7 @@ mod tests {
             "src/app/api/helpers/thing.ts",
         ] {
             assert!(
-                !Parser::is_route_file(std::path::Path::new(path)),
+                !Parser::is_route_file(path),
                 "{} is a helper, not a route file",
                 path
             );
