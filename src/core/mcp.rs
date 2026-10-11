@@ -33,6 +33,78 @@ pub struct CheckDriftRequest {
     pub file_path: String,
 }
 
+/// The committed rules that govern this file, read from `.archex/rules/`.
+///
+/// The `rules` table died with SCHEMA_VERSION 3 — a rule that exists only in
+/// a local index enforces nothing on anyone else's machine — but this caller
+/// was left joining the empty table and answering `rules: []`. An empty array
+/// reads to an agent as "nothing applies to this file", which is the one
+/// answer that must never be returned by accident.
+///
+/// A rule governs a file when the file's module (or layer) is on its FROM
+/// side: a rule about "ui must not import db" describes what ui files may not
+/// do, so it is context for ui files and nothing for a db file.
+fn rules_for_file(
+    root: &Path,
+    file_path: &str,
+    module: &str,
+    layer: &str,
+) -> Vec<serde_json::Value> {
+    use crate::core::config::{Kind, Status};
+
+    // An unreadable rule file is reported by the gate and by check_drift.
+    // Here it must not take the whole context call down: an agent gets the
+    // module, the layer and the decisions even when the rules are broken.
+    let rules = crate::core::config::load_rules(root).unwrap_or_default();
+    let mut brief = Vec::new();
+    for rule in &rules {
+        if rule.status == Status::Retired {
+            continue;
+        }
+
+        let governs = match (&rule.boundary, &rule.pattern, &rule.presence) {
+            (Some(boundary), _, _) => {
+                boundary.from_layer == module || boundary.from_layer == layer
+            }
+            // Content rules are scoped by glob against the file path.
+            (None, Some(pattern), _) => {
+                crate::core::boundary::matches_any(file_path, &[pattern.scope.clone()])
+            }
+            (None, None, Some(presence)) => {
+                crate::core::boundary::matches_any(file_path, &[presence.applies_to.clone()])
+            }
+            (None, None, None) => false,
+        };
+        if !governs {
+            continue;
+        }
+
+        brief.push(serde_json::json!({
+            "id": rule.id,
+            "kind": match rule.kind {
+                Kind::Boundary => "boundary",
+                Kind::Pattern => "pattern",
+                Kind::Presence => "presence",
+            },
+            "status": match rule.status {
+                Status::Accepted => "accepted",
+                Status::Proposed => "proposed",
+                Status::Retired => "retired",
+            },
+            // Only an accepted boundary rule is actually judged today. A
+            // proposal shown as a rule would read as enforced and is not.
+            "enforced": rule.boundary.is_some() && rule.status == Status::Accepted,
+            "message": rule
+                .boundary
+                .as_ref().map(|b| b.message.clone())
+                .or_else(|| rule.pattern.as_ref().map(|p| p.message.clone()))
+                .or_else(|| rule.presence.as_ref().map(|p| p.message.clone()))
+                .unwrap_or_default(),
+        }));
+    }
+    brief
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordDecisionRequest {
@@ -105,7 +177,11 @@ impl ArchexService {
         #[tool(aggr)] req: GetContextRequest,
     ) -> Result<CallToolResult, rmcp::Error> {
         let db_path = Path::new(DB_PATH);
-        
+        // Rules live in committed files, not in the index, so the context
+        // answer reads them the same way the gate does.
+        let root = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+        let rel = crate::core::paths::normalize_in(&req.file_path, &root);
+
         let db = match Db::shared(db_path) {
             Ok(db) => db,
             Err(e) => {
@@ -137,7 +213,7 @@ impl ArchexService {
                         "file": req.file_path,
                         "module": ctx.module_name,
                         "layer": ctx.layer,
-                        "rules": ctx.rules,
+                        "rules": rules_for_file(&root, &rel, &ctx.module_name, &ctx.layer),
                         "decisions": decisions,
                         "decisions_omitted": omitted,
                         "decisions_omitted_note": omitted_note,

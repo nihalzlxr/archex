@@ -3,7 +3,7 @@ use tempfile::TempDir;
 
 mod common;
 
-use common::{call_mcp_tool, init, two_layer_fixture, write_decision};
+use common::{call_mcp_tool, init, two_layer_fixture, ui_no_db_rule, write_decision};
 
 const OLD: &str = "01J8K2A7B3C4D5E6F7G8H9J0KM";
 const NEW: &str = "01J8K2A7B3C4D5E6F7G8H9J0NN";
@@ -191,6 +191,57 @@ fn a_long_ledger_is_capped_and_says_how_many_were_left_out() {
     assert!(
         out.contains("more decision"),
         "what was left out must be counted, not swallowed, got:\n{}",
+        out
+    );
+}
+/// Step 3.5 regression: when the `rules` table died in Step 2.5, the MCP
+/// caller was never rewired to read `.archex/rules/*.toml`. An agent asking
+/// "what applies to this file?" got `rules: []` on a repo with an active
+/// rule — and an empty array reads as "nothing applies here".
+#[test]
+fn get_context_serves_the_committed_rules_that_apply_to_the_file() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+    ui_no_db_rule(root);
+    init(root);
+
+    let out = context_for(root, "src/components/Widget.tsx");
+    assert!(
+        out.contains("ui-no-db"),
+        "the rule governing this file must be served, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("Go through services"),
+        "with its message, so the agent knows the fix, got:\n{}",
+        out
+    );
+}
+
+/// The rule must not leak into files it does not govern: a db file is the
+/// target of this rule, not a subject of it.
+#[test]
+fn get_context_does_not_serve_a_rule_whose_from_side_is_a_different_module() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+    ui_no_db_rule(root);
+    init(root);
+
+    // Control, so the negative below cannot pass just because nothing is
+    // ever served.
+    let governed = context_for(root, "src/components/Widget.tsx");
+    assert!(
+        governed.contains("ui-no-db"),
+        "the rule must be served for the module it governs, got:\n{}",
+        governed
+    );
+
+    let out = context_for(root, "src/db/client.ts");
+    assert!(
+        !out.contains("ui-no-db"),
+        "ui-no-db does not govern a db file, got:\n{}",
         out
     );
 }
