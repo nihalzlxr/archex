@@ -60,6 +60,16 @@ pub enum RuleType {
     Warning,
 }
 
+/// A rule as it exists in the legacy database: attached to a module by NAME,
+/// which is how `rule migrate` maps it onto config.toml — or refuses.
+#[derive(Debug, Clone)]
+pub struct LegacyRule {
+    pub module: String,
+    pub rule_type: String,
+    pub description: String,
+    pub pattern: Option<String>,
+}
+
 impl From<String> for RuleType {
     fn from(s: String) -> Self {
         match s.as_str() {
@@ -555,6 +565,36 @@ impl Db {
         .collect();
         
         Ok(rules)
+    }
+
+    /// Every legacy DB rule with the name of the module it was attached to.
+    /// Legacy rules are keyed by module *name*, which is how the migration maps
+    /// them onto config.toml (or refuses, when the name is not in it).
+    pub fn all_legacy_rules(&self) -> Result<Vec<LegacyRule>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.name, r.rule_type, r.description, r.pattern
+             FROM rules r JOIN modules m ON r.module_id = m.id
+             ORDER BY m.name, r.id"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(LegacyRule {
+                module: row.get(0)?,
+                rule_type: row.get::<_, String>(1)?,
+                description: row.get(2)?,
+                pattern: row.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// How many rules still live only in the database. Anything above zero
+    /// means rules are being ignored by every path that reads files, so every
+    /// enforcing path says so (see `rule_engine::warn_legacy_db_rules`).
+    pub fn legacy_rule_count(&self) -> Result<i64> {
+        let conn = self.lock();
+        let count = conn.query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))?;
+        Ok(count)
     }
 
     pub fn insert_decision(&self, title: &str, context: Option<&str>, decision: &str) -> Result<i64> {

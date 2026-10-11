@@ -62,6 +62,8 @@ pub enum RuleCommands {
         #[arg(long)]
         purge: bool,
     },
+    /// Convert rules left in the database into committed files
+    Migrate,
 }
 
 pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
@@ -103,6 +105,7 @@ pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
             },
         ),
         RuleCommands::Remove { id, purge } => remove(&root, &id, purge),
+        RuleCommands::Migrate => migrate(&root),
     }
 }
 
@@ -533,3 +536,195 @@ fn toml_array(values: &[String]) -> String {
 // Referenced so the Status import documents intent: retire writes this value.
 #[allow(dead_code)]
 const _RETIRED: Status = Status::Retired;
+/// Convert rules that live only in the legacy database into committed files.
+///
+/// A database rule is keyed by module *name*. That name has to mean something
+/// in config.toml before it can become a file, because the file's `scope` IS
+/// that module's path. A rule whose module is not in the config is refused
+/// rather than migrated onto an invented scope: an invented scope is a wrong
+/// scope, and a wrong scope is a wrong rule the moment someone reads it.
+fn migrate(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let db = crate::core::db::Db::shared(&Path::new(crate::core::db::DB_PATH))?;
+    if db.legacy_rule_count().unwrap_or(0) == 0 {
+        println!(
+            "nothing to migrate — no rules in the database. Rules live in {}.",
+            rules_dir(root).display()
+        );
+        return Ok(());
+    }
+
+    let config = config::Config::load(root)?;
+    let legacy = db.all_legacy_rules()?;
+
+    // Collect every refusal before writing anything: a half-migrated rules
+    // directory is worse than an untouched one, because the human has to work
+    // out which half is real.
+    let mut refusals: Vec<String> = Vec::new();
+    let mut plan: Vec<Migrated> = Vec::new();
+
+    for rule in &legacy {
+        let Some(module) = config.modules.iter().find(|m| m.name == rule.module) else {
+            refusals.push(format!("module `{}` (rule: {})", rule.module, rule.description));
+            continue;
+        };
+        let Some(pattern) = rule.pattern.clone().filter(|p| !p.trim().is_empty()) else {
+            refusals.push(format!(
+                "rule `{}` on module `{}` has no pattern — there is nothing to migrate",
+                rule.description, rule.module
+            ));
+            continue;
+        };
+        let mode = match rule.rule_type.as_str() {
+            "forbidden" => "forbidden",
+            "required" => "required",
+            "warning" => "warning",
+            other => {
+                refusals.push(format!("rule `{}` has unknown type `{}`", rule.description, other));
+                continue;
+            }
+        };
+        plan.push(Migrated {
+            id: String::new(),
+            scope: module.path.clone(),
+            module: rule.module.clone(),
+            description: rule.description.clone(),
+            pattern,
+            mode: mode.to_string(),
+        });
+    }
+
+    if !refusals.is_empty() {
+        let plural = if refusals.len() == 1 { "" } else { "s" };
+        return Err(format!(
+            "{} legacy rule{} cannot be migrated, and nothing was written:\n  {}\n\n\
+             Add the missing module{} to .archex/config.toml (with the path these rules \
+             applied to), or delete the rule{} from the database, then run \
+             `archex rule migrate` again.",
+            refusals.len(),
+            plural,
+            refusals.join("\n  "),
+            plural,
+            plural
+        )
+        .into());
+    }
+
+    let mut existing = config::load_rules(root)?;
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+
+    for mut migrated in plan {
+        // Idempotent by content, not by flag: a message already present in a
+        // committed rule file means this rule has been migrated.
+        if existing
+            .iter()
+            .any(|r| r.pattern.as_ref().is_some_and(|p| p.message == migrated.description))
+        {
+            skipped += 1;
+            continue;
+        }
+
+        migrated.id = unique_id(&slugify(&migrated.description), &existing);
+        let body = render_migrated_rule(&migrated)?;
+        FileRule::parse_str(&body)
+            .map_err(|e| format!("the migrated rule is not valid, nothing was written: {}", e))?;
+
+        let path = rule_path(root, &migrated.id);
+        std::fs::write(&path, body)?;
+        println!(
+            "  wrote {}  <- `{}` on module `{}`",
+            path.display(),
+            migrated.description,
+            migrated.module
+        );
+
+        existing.push(FileRule::parse_str(&std::fs::read_to_string(&path)?)?);
+        written += 1;
+    }
+
+    if written == 0 && skipped == 0 {
+        println!("nothing to migrate.");
+    } else {
+        println!(
+            "wrote {} rule file(s){}. Commit them — the gate reads what is committed.",
+            written,
+            if skipped > 0 {
+                format!(", skipped {} already migrated", skipped)
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
+}
+
+struct Migrated {
+    id: String,
+    scope: String,
+    module: String,
+    description: String,
+    pattern: String,
+    mode: String,
+}
+
+fn render_migrated_rule(rule: &Migrated) -> Result<String, Box<dyn std::error::Error>> {
+    // A pattern that is not valid regex would sit in the rules directory and
+    // fail to compile in CI. Fix it here, or say why we cannot.
+    regex::Regex::new(&rule.pattern).map_err(|e| {
+        format!(
+            "rule `{}` has a pattern that is not a valid regex ({}): fix it in the \
+             database, or write the rule by hand with `archex rule add --kind pattern`",
+            rule.description, e
+        )
+    })?;
+
+    let mut body = String::new();
+    body.push_str("schema_version = 1\n");
+    body.push_str(&format!("id = \"{}\"\n", toml_escape(&rule.id)));
+    body.push_str("status = \"accepted\"\n");
+    body.push_str("kind = \"pattern\"\n");
+    // A migrated rule is a warning until a human promotes it. It was never
+    // enforced (nothing read DB rules since Step 2.5), so promoting it to an
+    // error in the same command would turn migration into a CI incident.
+    body.push_str("severity = \"warning\"\n");
+    body.push('\n');
+    body.push_str("[pattern]\n");
+    body.push_str(&format!("scope = \"{}\"\n", toml_escape(&rule.scope)));
+    body.push_str(&format!("mode = \"{}\"\n", rule.mode));
+    body.push_str(&format!("pattern = \"{}\"\n", toml_escape(&rule.pattern)));
+    body.push_str(&format!("message = \"{}\"\n", toml_escape(&rule.description)));
+    Ok(body)
+}
+
+/// A readable id from the rule's own description, de-duplicated against what
+/// is already committed. An id nobody has to reverse-engineer beats a counter
+/// nobody can read.
+fn unique_id(base: &str, existing: &[FileRule]) -> String {
+    let mut candidate = base.to_string();
+    let mut n = 2;
+    while existing.iter().any(|r| r.id == candidate) {
+        candidate = format!("{}-{}", base, n);
+        n += 1;
+    }
+    candidate
+}
+
+fn slugify(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = true;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = out.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "migrated-rule".to_string()
+    } else {
+        slug
+    }
+}

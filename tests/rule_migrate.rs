@@ -59,8 +59,8 @@ fn migrate_converts_legacy_db_rules_to_files() {
         .current_dir(root)
         .assert()
         .success()
-        .stdout(predicate::str::contains("pattern"))
-        .stdout(predicate::str::contains("No direct db imports"));
+        .stdout(predicate::str::contains("no-direct-db-imports"))
+        .stdout(predicate::str::contains("pattern"));
 }
 
 /// Migrating twice must not duplicate anything, and with nothing left to
@@ -115,8 +115,16 @@ fn migrate_refuses_a_rule_whose_module_is_not_in_the_config() {
     two_layer_fixture(root);
     init(root);
 
-    // `docs` is a directory in the repo but has no module in config.toml.
-    std::fs::create_dir_all(root.join("src/legacy")).unwrap();
+    // A module row the DB still knows about, which config.toml does not: the
+    // exact shape a pre-2.5 index leaves behind.
+    {
+        let conn = Connection::open(root.join(".archex/archex.db")).unwrap();
+        conn.execute(
+            "INSERT INTO modules (name, layer, path_pattern) VALUES ('legacy', 'legacy', 'src/legacy/**')",
+            [],
+        )
+        .unwrap();
+    }
     legacy_db_rule(root, "legacy", "Old rule with nowhere to live", "x");
 
     Command::cargo_bin("archex")
@@ -161,7 +169,7 @@ fn the_gate_says_when_legacy_db_rules_are_being_ignored() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        text.contains("legacy DB rules") && text.contains("migrate"),
+        text.contains("legacy DB rule") && text.contains("archex rule migrate"),
         "the gate must say legacy DB rules are ignored and how to fix it, got:\n{}",
         text
     );
@@ -179,7 +187,7 @@ fn the_gate_says_when_legacy_db_rules_are_being_ignored() {
         String::from_utf8_lossy(&advisory.stderr)
     );
     assert!(
-        advisory_text.contains("legacy DB rules"),
+        advisory_text.contains("legacy DB rule"),
         "the advisory must say it too, got:\n{}",
         advisory_text
     );

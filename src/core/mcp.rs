@@ -426,6 +426,8 @@ impl ArchexService {
             )]));
         }
 
+        crate::core::rule_engine::warn_legacy_db_rules(&db);
+
         let (config, rules) = match config::Config::load(&root).and_then(|c| {
             let rules = config::load_rules(&root)?;
             Ok((c, rules))

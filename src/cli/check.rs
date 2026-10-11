@@ -32,6 +32,7 @@ pub fn run(file_path: String) -> Result<(), Box<dyn std::error::Error>> {
     if db.get_all_modules()?.is_empty() {
         return Err("no modules in the index. Run `archex init` first.".into());
     }
+    crate::core::rule_engine::warn_legacy_db_rules(&db);
 
     let config = config::Config::load(&root).map_err(|e| format!(
         "{}\n\nThe advisory needs a committed architecture. Run `archex init` to draft one.",
@@ -103,6 +104,7 @@ pub fn run_gate(strict: bool, update_baseline: bool) -> Result<bool, Box<dyn std
     if db.get_all_modules()?.is_empty() {
         return Err("no modules in the index. Run `archex init` first.".into());
     }
+    crate::core::rule_engine::warn_legacy_db_rules(&db);
 
     let config = Config::load(&root).map_err(|e| format!(
         "{}\n\nThe gate needs a committed architecture. Run `archex init` to draft one.",

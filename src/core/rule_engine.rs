@@ -60,3 +60,25 @@ mod tests {
         assert!(!pattern_matches("import { y } from 'yup';\n", "from 'zod'"));
     }
 }
+
+/// Say, once, that rules exist in the database and are being ignored by every
+/// path that reads committed files.
+///
+/// This is the loud half of "no rule may match nothing silently". Between the
+/// moment `rule add` stopped writing DB rows and the moment the table is
+/// dropped, a rule left behind in an old database is a rule nobody enforces.
+/// Silently ignoring it would be the exact failure Step 2.5 exists to remove,
+/// so every enforcing path — gate, per-file advisory, MCP tool — says so, and
+/// names the command that converts them.
+pub fn warn_legacy_db_rules(db: &crate::core::db::Db) -> usize {
+    let count = db.legacy_rule_count().unwrap_or(0) as usize;
+    if count > 0 {
+        let noun = if count == 1 { "rule is" } else { "rules are" };
+        eprintln!(
+            "warning: {} legacy DB {} ignored — nothing reads the database any \
+             more. Run `archex rule migrate` to write them as files.",
+            count, noun
+        );
+    }
+    count
+}
