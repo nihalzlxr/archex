@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use assert_cmd::Command;
 use tempfile::TempDir;
 

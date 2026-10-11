@@ -184,7 +184,7 @@ fn a_long_ledger_is_capped_and_says_how_many_were_left_out() {
 
     let out = context_for(root, "src/db/client.ts");
     assert!(
-        out.contains("Decision number 0"),
+        out.contains("Decision number 11"),
         "decisions must actually be injected, got:\n{}",
         out
     );

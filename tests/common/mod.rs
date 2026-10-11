@@ -207,7 +207,7 @@ pub fn call_mcp_tool(root: &Path, tool: &str, arguments: &str) -> String {
 }
 
 /// One committed decision, in the shape the ledger validator accepts.
-pub fn decision_file(id: &str, slug: &str, title: &str, scope: &str, supersedes: &str) -> String {
+pub fn decision_file(id: &str, title: &str, scope: &str, supersedes: &str) -> String {
     format!(
         r#"---
 schema_version = 1
@@ -246,7 +246,7 @@ pub fn write_decision(
     let dir = root.join(".archex/decisions");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{}-{}.md", id, slug));
-    fs::write(&path, decision_file(id, slug, title, scope, supersedes)).unwrap();
+    fs::write(&path, decision_file(id, title, scope, supersedes)).unwrap();
     path.to_string_lossy().to_string()
 }
 

@@ -36,6 +36,43 @@ pub struct CheckDriftRequest {
 #[derive(Debug, Clone)]
 pub struct ArchexService;
 
+/// How many decisions ride along in one context. A brief that pushes out
+/// the module's own rules has cost more than it gave; the count of what
+/// was left out ships with it, so a short list never reads as a complete
+/// one.
+const MAX_DECISIONS_IN_CONTEXT: usize = 10;
+
+/// Characters per decision body in the brief.
+const DECISION_SUMMARY_LIMIT: usize = 600;
+
+/// The decisions whose scope covers this file's module or layer, newest
+/// first, already trimmed to a brief — plus how many were left out, so a
+/// capped list never reads as a complete one.
+fn decisions_for(db: &Db, module: &str, layer: &str) -> (Vec<serde_json::Value>, usize) {
+    let mut records = match db.decisions_for_scope(module, layer) {
+        Ok(records) => records,
+        // An unreadable index is reported through `ledger_error`; here it
+        // must not become an exception that takes the tool down.
+        Err(_) => Vec::new(),
+    };
+    let omitted = records.len().saturating_sub(MAX_DECISIONS_IN_CONTEXT);
+    records.truncate(MAX_DECISIONS_IN_CONTEXT);
+    let brief = records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "id": record.id,
+                "title": record.title,
+                "status": record.status,
+                "author": record.author,
+                "recorded_at": record.recorded_at,
+                "summary": crate::core::ledger::summary(record, DECISION_SUMMARY_LIMIT),
+            })
+        })
+        .collect();
+    (brief, omitted)
+}
+
 #[tool(tool_box)]
 impl ArchexService {
     #[tool(description = "Get architecture context, module, layer and rules for a file")]
@@ -58,19 +95,38 @@ impl ArchexService {
         };
         
         match db.get_context_for_file(&req.file_path) {
-            Ok(Some(ctx)) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&serde_json::json!({
-                    "found": true,
-                    "file": req.file_path,
-                    "module": ctx.module_name,
-                    "layer": ctx.layer,
-                    "rules": ctx.rules
-                })).unwrap()
-            )])),
+            Ok(Some(ctx)) => {
+                let (decisions, omitted) = decisions_for(&db, &ctx.module_name, &ctx.layer);
+                let omitted_note = if omitted > 0 {
+                    Some(format!(
+                        "{} more decision{} apply to this file — \
+                         `archex decide list` shows every current one.",
+                        omitted,
+                        if omitted == 1 { "" } else { "s" }
+                    ))
+                } else {
+                    None
+                };
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "found": true,
+                        "file": req.file_path,
+                        "module": ctx.module_name,
+                        "layer": ctx.layer,
+                        "rules": ctx.rules,
+                        "decisions": decisions,
+                        "decisions_omitted": omitted,
+                        "decisions_omitted_note": omitted_note,
+                        "ledger_error": LEDGER_ERROR.get(),
+                    })).unwrap()
+                )]))
+            }
             Ok(None) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&serde_json::json!({
                     "found": false,
-                    "message": format!("File '{}' not mapped. Run 'archex init' to scan project.", req.file_path)
+                    "message": format!("File '{}' not mapped. Run 'archex init' to scan project.", req.file_path),
+                    "decisions": [],
+                    "ledger_error": LEDGER_ERROR.get(),
                 })).unwrap()
             )])),
             Err(e) => Ok(CallToolResult::success(vec![Content::text(
@@ -512,8 +568,27 @@ impl ServerHandler for ArchexService {
 }
 
 pub async fn start_server() -> anyhow::Result<()> {
+    // The ledger is synced when the server starts, not when someone
+    // remembers to: a teammate's `git pull` has to reach this session's
+    // agents with no command in between. A failure is remembered and
+    // reported by `get_context` rather than swallowed — a stale ledger
+    // served silently is worse than no ledger.
+    sync_ledger();
+
     let service = ArchexService;
     let server = service.serve(stdio()).await?;
     server.waiting().await?;
     Ok(())
+}
+
+/// The last startup sync failed. `get_context` reports it, because serving
+/// a stale ledger without saying so is the failure this exists to prevent.
+static LEDGER_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn sync_ledger() {
+    let root = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    if let Err(error) = crate::core::ledger::sync(&root) {
+        eprintln!("archex: ledger sync failed: {}", error);
+        let _ = LEDGER_ERROR.set(error);
+    }
 }
