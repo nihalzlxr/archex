@@ -1,0 +1,193 @@
+use assert_cmd::Command;
+use std::fs;
+use std::path::Path;
+use tempfile::TempDir;
+
+mod common;
+
+use common::{init, two_layer_fixture};
+
+fn check(root: &Path) -> String {
+    let out = Command::cargo_bin("archex")
+        .unwrap()
+        .arg("check")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+fn boundary_rule(root: &Path) {
+    fs::create_dir_all(root.join(".archex/rules")).unwrap();
+    fs::write(
+        root.join(".archex/rules/ui-no-db.toml"),
+        r#"schema_version = 1
+id = "ui-no-db"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "ui"
+to_layer = "db"
+message = "UI must not import the db layer."
+"#,
+    )
+    .unwrap();
+}
+
+/// A pnpm monorepo, measured on project/fitness: a workspace import
+/// resolves through node_modules to `packages/engine/dist/index.js`, which
+/// is build output. archex indexes `packages/engine/src/**`, so the edge
+/// resolves to a file no module owns, and the graph never sees it.
+///
+/// The rule then reports "0 candidate edges" — which reads as a clean run.
+/// It is not a clean run. It is a hole in the graph wearing one.
+#[test]
+fn an_edge_that_resolves_outside_the_index_is_counted_not_dropped() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+    boundary_rule(root);
+
+    // The db module owns src/db/** only. Its package entry point lives in
+    // dist/, which is gitignored and therefore never indexed.
+    fs::create_dir_all(root.join("packages/db/dist")).unwrap();
+    fs::write(
+        root.join("packages/db/package.json"),
+        r#"{ "name": "@fixture/db", "main": "./dist/index.js" }"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("packages/db/dist/index.js"),
+        "export const client = () => null;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/components/Widget.tsx"),
+        "import { client } from '@fixture/db';\nexport function Widget() {\n  return client();\n}\n",
+    )
+    .unwrap();
+
+    let config = fs::read_to_string(root.join(".archex/config.toml")).unwrap();
+    fs::write(
+        root.join(".archex/config.toml"),
+        config.replace(
+            r#"name = "db"
+layer = "db"
+path = "src/db/**""#,
+            r#"name = "db"
+layer = "db"
+path = "packages/db/**""#,
+        ),
+    )
+    .unwrap();
+
+    init(root);
+    let out = check(root);
+
+    assert!(
+        out.contains("outside the index"),
+        "an edge that resolves to an unindexed file must be counted, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("packages/db/dist/index.js"),
+        "and the graph hole must be named, got:\n{}",
+        out
+    );
+}
+
+/// The same hole, from the rule's side: a boundary rule whose from-files
+/// and to-files exist but whose edges all vanish into build output must
+/// not read as "clean". It must say the rule could not judge them.
+#[test]
+fn a_rule_whose_edges_all_left_the_graph_says_it_could_not_judge_them() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+    boundary_rule(root);
+
+    fs::create_dir_all(root.join("packages/db/dist")).unwrap();
+    fs::write(
+        root.join("packages/db/package.json"),
+        r#"{ "name": "@fixture/db", "main": "./dist/index.js" }"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("packages/db/dist/index.js"),
+        "export const client = () => null;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/components/Widget.tsx"),
+        "import { client } from '@fixture/db';\nexport function Widget() {\n  return client();\n}\n",
+    )
+    .unwrap();
+    let config = fs::read_to_string(root.join(".archex/config.toml")).unwrap();
+    fs::write(
+        root.join(".archex/config.toml"),
+        config.replace(
+            r#"name = "db"
+layer = "db"
+path = "src/db/**""#,
+            r#"name = "db"
+layer = "db"
+path = "packages/db/**""#,
+        ),
+    )
+    .unwrap();
+
+    init(root);
+    let out = check(root);
+
+    assert!(
+        out.contains("could not judge"),
+        "a rule that examined nothing because the graph has holes must say so, got:\n{}",
+        out
+    );
+}
+
+/// Measured on fitness: 906 of 951 "unclassified" imports were react, next
+/// and drizzle-orm — npm packages that are never in the repo and never
+/// will be. Counting them next to the 23 genuinely unresolved first-party
+/// imports means the number that matters is invisible.
+#[test]
+fn external_packages_are_not_counted_as_unresolved_imports() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+
+    fs::write(
+        root.join("src/components/Widget.tsx"),
+        "import { client } from '../db/client';\n\
+         import { useState } from 'react';\n\
+         import { next } from 'next/headers';\n\
+         import { broken } from '@/lib/does-not-exist';\n\
+         export function Widget() {\n  return client();\n}\n",
+    )
+    .unwrap();
+
+    init(root);
+    let out = check(root);
+
+    assert!(
+        out.contains("2 external package import(s)"),
+        "npm packages must be counted as themselves, not as gaps, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("1 unresolved first-party import(s)"),
+        "the first-party gap is the number that matters, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("does-not-exist"),
+        "and it must be named, got:\n{}",
+        out
+    );
+}
