@@ -982,7 +982,6 @@ mod tests {
         db.init_schema().unwrap();
         db.insert_module("src", "src", "src/**").unwrap();
         db.insert_module("packages", "packages", "packages/**").unwrap();
-        db.insert_rule(db.get_module_id_by_name("src").unwrap().unwrap(), "forbidden", "no db", Some("x")).unwrap();
 
         crate::core::parser::Parser::new(std::sync::Arc::new(db.clone()))
             .scan(fx.root())

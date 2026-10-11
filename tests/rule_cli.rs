@@ -179,7 +179,7 @@ fn rule_list_reads_files_not_the_db() {
         .current_dir(root2)
         .assert()
         .success()
-        .stdout(predicate::str::contains("no rules"));
+        .stdout(predicate::str::contains("No rules"));
 }
 
 /// `rule remove` retires by default: the file stays (decisions will reference
@@ -294,7 +294,7 @@ fn rule_add_pattern_rule_says_it_is_not_enforced_yet() {
         .current_dir(root)
         .assert()
         .success()
-        .stdout(predicate::str::contains("not enforced yet"));
+        .stdout(predicate::str::contains("nothing checks it yet"));
 
     assert!(root.join(".archex/rules/no-fetch-in-ui.toml").exists());
 }

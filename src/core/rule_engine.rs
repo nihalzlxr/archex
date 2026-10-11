@@ -11,6 +11,12 @@ use regex::Regex;
 /// check_drift MCP tool, rule test). Never compile a rule pattern against
 /// lowercased content with an original-case pattern — that silently never
 /// matches (the bug this function replaced).
+///
+/// Currently unreferenced by any enforcement path: the file-based pattern
+/// engine (PLAN.md §19.1) is the next slice, and the DB-backed path that used
+/// this matcher was removed in Step 2.5. Kept, with its case-sensitivity
+/// regression tests, because the file-based engine is the reason it exists.
+#[allow(dead_code)]
 pub fn pattern_matches(content: &str, pattern: &str) -> bool {
     let case_insensitive = format!("(?i){}", pattern);
     if let Ok(re) = Regex::new(&case_insensitive) {

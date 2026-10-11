@@ -15,13 +15,6 @@ pub(crate) struct ModuleSpec {
     pub(crate) name: String,
     pub(crate) layer: String,
     pub(crate) path_pattern: String,
-    pub(crate) rules: Vec<RuleSpec>,
-}
-
-pub(crate) struct RuleSpec {
-    pub(crate) rule_type: &'static str,
-    pub(crate) description: &'static str,
-    pub(crate) pattern: Option<&'static str>,
 }
 
 pub fn run() {
@@ -198,7 +191,6 @@ fn generic_plan(root: &Path, curated: &[ModuleSpec]) -> Vec<ModuleSpec> {
                 path_pattern: format!("{}/**", name),
                 layer: name.clone(),
                 name,
-                rules: Vec::new(),
             }
         })
         .collect();
@@ -250,43 +242,22 @@ fn has_indexable_file(root: &Path, dir: &Path) -> bool {
     indexable_files(root, dir).next().is_some()
 }
 
-/// Insert whatever the plan says is missing. Idempotent per module and per
-/// rule, so `init` twice is a no-op.
+/// Insert whatever the plan says is missing. Idempotent per module, so `init`
+/// twice is a no-op. Rules are never seeded: they are human-authored files in
+/// `.archex/rules/`, and a rule archex invented for your repo is a rule you
+/// did not choose.
 pub(crate) fn seed_modules(db: &Db, plan: &[ModuleSpec]) -> usize {
     let mut seeded = 0;
     for spec in plan {
-        let module_id = match db.get_module_id_by_name(&spec.name).ok().flatten() {
-            Some(id) => id,
-            None => {
-                db.insert_module(&spec.name, &spec.layer, &spec.path_pattern)
-                    .expect("Failed to insert module");
-                seeded += 1;
-                match db.get_module_id_by_name(&spec.name).ok().flatten() {
-                    Some(id) => id,
-                    None => continue,
-                }
-            }
-        };
-
-        for rule in &spec.rules {
-            let exists = db
-                .rule_exists(module_id, rule.rule_type, rule.description, rule.pattern)
-                .unwrap_or(false);
-            if exists {
-                continue;
-            }
-            db.insert_rule(
-                module_id,
-                rule.rule_type,
-                rule.description,
-                rule.pattern,
-            )
-            .expect("Failed to insert rule");
+        if db.get_module_id_by_name(&spec.name).ok().flatten().is_some() {
+            continue;
         }
+        db.insert_module(&spec.name, &spec.layer, &spec.path_pattern)
+            .expect("Failed to insert module");
+        seeded += 1;
     }
 
-    let rule_count = db.get_rule_count().expect("Failed to get rule count");
-    eprintln!("Seeded {} new modules; {} rules total.", seeded, rule_count);
+    eprintln!("Seeded {} new modules.", seeded);
     seeded
 }
 

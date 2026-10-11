@@ -353,15 +353,6 @@ impl Db {
 
     /// Returns the new rule's id: callers print it, and ids are NOT the row
     /// count once anything has been deleted.
-    pub fn insert_rule(&self, module_id: i64, rule_type: &str, description: &str, pattern: Option<&str>) -> Result<i64> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO rules (module_id, rule_type, description, pattern) VALUES (?1, ?2, ?3, ?4)",
-            (module_id, rule_type, description, pattern),
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
     pub fn get_all_modules(&self) -> Result<Vec<Module>> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT id, name, layer, path_pattern FROM modules")?;
@@ -543,6 +534,9 @@ impl Db {
         }
     }
 
+    /// Legacy DB rules. Still read by `archex rule migrate` (Step 2.5), which
+    /// converts them into committed files; the table dies with the schema bump.
+    #[allow(dead_code)]
     pub fn get_rules_for_module(&self, module_id: i64) -> Result<Vec<Rule>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -561,31 +555,6 @@ impl Db {
         .collect();
         
         Ok(rules)
-    }
-
-    pub fn get_rule_count(&self) -> Result<i64> {
-        let conn = self.lock();
-        conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
-    }
-
-    pub fn rule_exists(&self, module_id: i64, rule_type: &str, description: &str, pattern: Option<&str>) -> Result<bool> {
-        let conn = self.lock();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM rules
-             WHERE module_id = ?1 AND rule_type = ?2 AND description = ?3
-               AND ((?4 IS NULL AND pattern IS NULL) OR pattern = ?4)",
-            (module_id, rule_type, description, pattern),
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    pub fn delete_rule(&self, rule_id: i64) -> Result<()> {
-        let conn = self.lock();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM rules WHERE id = ?1", [rule_id])?;
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn insert_decision(&self, title: &str, context: Option<&str>, decision: &str) -> Result<i64> {
@@ -1124,13 +1093,6 @@ mod tests {
         let module_id = db
             .insert_module("components", "ui", "src/components/**")
             .expect("insert module");
-        db.insert_rule(
-            module_id,
-            "forbidden",
-            "ui must not import db",
-            Some("from ['\"]@/db"),
-        )
-        .expect("insert rule");
         db.upsert_file("src/components/Button.tsx", module_id)
             .expect("upsert file");
         db.insert_symbols_batch(&[Symbol {
@@ -1344,7 +1306,6 @@ mod tests {
         one.init_schema().unwrap();
         again.init_schema().unwrap();
         one.insert_module("components", "ui", "src/components/**").unwrap();
-        assert_eq!(again.get_rule_count().unwrap(), 0);
         assert_eq!(again.get_all_modules().unwrap().len(), 1);
     }
 
