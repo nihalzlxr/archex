@@ -91,7 +91,7 @@ path = "packages/db/**""#,
     let out = check(root);
 
     assert!(
-        out.contains("outside the index"),
+        out.contains("OUTSIDE the index"),
         "an edge that resolves to an unindexed file must be counted, got:\n{}",
         out
     );
@@ -188,6 +188,48 @@ fn external_packages_are_not_counted_as_unresolved_imports() {
     assert!(
         out.contains("does-not-exist"),
         "and it must be named, got:\n{}",
+        out
+    );
+}
+/// Measured on fitness: `@sentry/nextjs`, `@radix-ui/react-dialog` and
+/// `@better-auth/passkey` do not resolve, and no syntactic rule can say
+/// whether they are npm packages or an alias to a directory called
+/// `radix-ui`. Guessing either way is the one thing the resolver refuses
+/// to do, so the gate reports the ambiguity instead of folding it into a
+/// count that means something else.
+#[test]
+fn a_scoped_specifier_that_did_not_resolve_is_reported_as_ambiguous() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+
+    fs::write(
+        root.join("src/components/Widget.tsx"),
+        "import { client } from '../db/client';\n\
+         import { capture } from '@sentry/nextjs';\n\
+         import { Dialog } from '@radix-ui/react-dialog';\n\
+         import { gone } from '../lib/gone';\n\
+         export function Widget() {\n  return client();\n}\n",
+    )
+    .unwrap();
+
+    init(root);
+    let out = check(root);
+
+    assert!(
+        out.contains("2 ambiguous import(s)"),
+        "a scoped specifier that did not resolve must not be filed under \
+         either count, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("radix-ui/react-dialog"),
+        "and it must be named, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("1 unresolved first-party import(s)"),
+        "while the unambiguous gap stays in its own count, got:\n{}",
         out
     );
 }

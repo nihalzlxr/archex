@@ -50,6 +50,10 @@ pub struct RuleStatus {
     pub edges: usize,
     /// Type-only edges this rule did not judge, because it did not ask to.
     pub type_only_skipped: usize,
+    /// Edges that crossed these two modules and then left the graph —
+    /// resolved to a file no module owns. Counted so "0 candidates" can be
+    /// read for what it is.
+    pub escaped: usize,
     /// One side has no files: almost certainly a typo or a dead layer.
     pub suspicious: bool,
 }
@@ -59,6 +63,38 @@ pub struct Coverage {
     pub classified_files: usize,
     pub unclassified_files: usize,
     pub unresolved_imports: usize,
+    /// Imports that resolved to a real file no module owns — typically a
+    /// workspace package's built entry point (`packages/engine/dist/…`).
+    /// Measured on project/fitness: 163 of them, and every cross-package
+    /// boundary rule read clean because of them.
+    pub outside_index: usize,
+    /// Third-party packages. Not gaps: `react` is not in the repo and
+    /// never will be. Counted apart so they cannot dilute the first-party
+    /// number that actually means something.
+    pub external_packages: usize,
+    /// The first few offenders, so "12 imports left the graph" is
+    /// actionable rather than a number to shrug at.
+    pub outside_index_examples: Vec<String>,
+    pub unresolved_examples: Vec<String>,
+    /// The escaped edges themselves, kept so a rule can be told how many of
+    /// them crossed ITS two sides. A count alone cannot say that.
+    pub escaped: Vec<EscapedEdge>,
+}
+
+/// An import that resolved to a real file outside every module.
+#[derive(Debug, Clone)]
+pub struct EscapedEdge {
+    pub from_module: String,
+    pub to_file: String,
+}
+
+impl Coverage {
+    fn example(list: &mut Vec<String>, value: String) {
+        const MAX: usize = 5;
+        if list.len() < MAX {
+            list.push(value);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -71,6 +107,14 @@ pub struct BoundaryReport {
     /// Imports whose specifier did not resolve. Unclassified, never a
     /// violation.
     pub unresolved_imports: usize,
+    /// See `Coverage::outside_index`: edges that resolved to a file no
+    /// module owns. They left the graph, so a rule cannot judge them.
+    pub outside_index: usize,
+    pub external_packages: usize,
+    pub outside_index_examples: Vec<String>,
+    pub unresolved_examples: Vec<String>,
+    /// Rules whose only edges were the ones that left the graph.
+    pub rules_that_could_not_judge: Vec<String>,
 }
 
 impl BoundaryReport {
@@ -106,6 +150,10 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
         classified_files: coverage.classified_files,
         unclassified_files: coverage.unclassified_files,
         unresolved_imports: coverage.unresolved_imports,
+        outside_index: coverage.outside_index,
+        external_packages: coverage.external_packages,
+        outside_index_examples: coverage.outside_index_examples.clone(),
+        unresolved_examples: coverage.unresolved_examples.clone(),
         ..Default::default()
     };
 
@@ -135,6 +183,11 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
             .iter()
             .filter(|e| from_modules.contains(&e.from_module) && to_modules.contains(&e.to_module));
 
+        // Edges that crossed these two modules but left the graph before
+        // they got here. A rule cannot judge what it cannot see, and a
+        // rule that examined nothing must not read as a clean result.
+        let escaped = escaped_edges(&coverage, &from_modules, &to_modules, &config.modules);
+
         // A type-only edge compiles to nothing. Skipping it is the default,
         // and the count of what was skipped is reported rather than swallowed:
         // a rule that quietly judged nothing must never look like a clean run.
@@ -155,8 +208,13 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
                 edges: candidates.len(),
                 type_only_skipped,
                 suspicious: from_files == 0 || to_files == 0,
+                escaped,
             },
         );
+
+        if escaped > 0 && candidates.is_empty() && !boundary.include_tests {
+            report.rules_that_could_not_judge.push(rule.id.clone());
+        }
 
         for edge in candidates {
             if !boundary.include_tests && is_test_file(&edge.from_file, &test_globs) {
@@ -220,14 +278,42 @@ fn collect_edges(db: &Db) -> Result<(Vec<Edge>, Coverage), ConfigError> {
             .map_err(|e| ConfigError(format!("cannot read imports: {}", e)))?
         {
             let Some(target) = import.resolved_to else {
-                coverage.unresolved_imports += 1;
+                // `react` is not in this repository and never will be.
+                // Calling that an unclassified import would bury the
+                // first-party gaps under a hundred lines of npm.
+                if import.kind == ImportKind::Package {
+                    coverage.external_packages += 1;
+                } else {
+                    coverage.unresolved_imports += 1;
+                    Coverage::example(
+                        &mut coverage.unresolved_examples,
+                        format!("{}: {}", file, import.imported_from),
+                    );
+                }
                 continue;
             };
-            let (Some(from_module), Some(to_module)) =
-                (db.module_of_file(file), db.module_of_file(&target))
-            else {
+
+            let Some(from_module) = db.module_of_file(file) else {
                 continue;
             };
+            let Some(to_module) = db.module_of_file(&target) else {
+                // It resolved to a real file that no module owns — a
+                // workspace package's built entry point, usually. The edge
+                // is real and it is NOT in the graph, so it is counted and
+                // named. Dropping it here is how a monorepo's boundary
+                // rules report "0 candidate edges" on code that has plenty.
+                coverage.outside_index += 1;
+                Coverage::example(
+                    &mut coverage.outside_index_examples,
+                    format!("{} -> {}", file, target),
+                );
+                coverage.escaped.push(EscapedEdge {
+                    from_module: from_module.clone(),
+                    to_file: target,
+                });
+                continue;
+            };
+
             edges.push(Edge {
                 from_file: file.clone(),
                 to_file: target,
@@ -304,6 +390,34 @@ pub fn is_test_file(path: &str, globs: &[String]) -> bool {
 pub fn matches_any(path: &str, globs: &[String]) -> bool {
     let compiled = compile(globs);
     compiled.iter().any(|p| matches_pattern(p, path))
+}
+
+/// How many edges crossed this rule's two sides and then left the graph.
+///
+/// The escaped edge has no module on its target side — that is why it is
+/// escaped — so the target is matched against the `to` modules' path
+/// patterns instead. That is the same question the boundary engine asks
+/// everywhere else, not a guess about what the file is.
+fn escaped_edges(
+    coverage: &Coverage,
+    from_modules: &std::collections::BTreeSet<String>,
+    to_modules: &std::collections::BTreeSet<String>,
+    modules: &[crate::core::config::ModuleConfig],
+) -> usize {
+    let patterns: Vec<String> = to_modules
+        .iter()
+        .filter_map(|name| modules.iter().find(|m| &m.name == name))
+        .map(|m| m.path.clone())
+        .collect();
+
+    coverage
+        .escaped
+        .iter()
+        .filter(|escaped| {
+            from_modules.iter().any(|name| *name == escaped.from_module)
+                && matches_any(&escaped.to_file, &patterns)
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -538,14 +652,19 @@ message = "m"
         let mut files = engine_files();
         files.push((
             "apps/web/src/feature.ts",
-            "import { schedule } from 'some-unknown-package';\n",
+            "import { gone } from '../lib/gone';\nimport { schedule } from 'some-unknown-package';\n",
         ));
         let repo = repo(&files);
         let report = run(&repo, &[entrypoint_rule()]);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
             report.unresolved_imports > 0,
-            "and it must still be COUNTED, not hidden"
+            "and the first-party gap must still be COUNTED, not hidden"
+        );
+        assert_eq!(
+            report.external_packages, 1,
+            "a bare package name is not a gap: it is not in this repo and \
+             never will be. Counting it as one buried the real number."
         );
     }
 
@@ -759,12 +878,16 @@ message = "m"
         files.push(("scripts/build.ts", "export const x = 1;\n"));
         files.push((
             "apps/web/src/feature.ts",
-            "import 'some-unknown-package';\n",
+            "import { gone } from '../lib/gone';\nimport 'some-unknown-package';\n",
         ));
         let repo = repo(&files);
         let report = run(&repo, &[entrypoint_rule()]);
         assert_eq!(report.unclassified_files, 1);
-        assert!(report.unresolved_imports >= 1);
+        assert!(
+            report.unresolved_imports >= 1,
+            "the first-party gap is the number that matters"
+        );
+        assert_eq!(report.external_packages, 1, "and npm packages are not gaps");
         assert_eq!(report.classified_files, 3);
     }
 

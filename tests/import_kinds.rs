@@ -148,7 +148,9 @@ fn type_only_imports_still_count_as_classified() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
-        stdout.contains("0 imports unclassified"),
+        stdout.contains("0 unresolved first-party import(s)")
+            && stdout.contains("0 external package import(s)")
+            && !stdout.contains("OUTSIDE the index"),
         "every import in the fixture resolves, including the type-only one:\n{}",
         stdout
     );

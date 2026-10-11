@@ -120,9 +120,30 @@ pub fn run_gate(strict: bool, update_baseline: bool) -> Result<bool, Box<dyn std
         report.classified_files, report.unclassified_files
     );
     println!(
-        "  {} imports unclassified (never a violation, never silently clean)",
+        "  {} unresolved first-party import(s) (never a violation, never silently clean)",
         report.unresolved_imports
     );
+    for example in &report.unresolved_examples {
+        println!("      {}", example);
+    }
+    println!(
+        "  {} external package import(s) — not in this repo, not counted as gaps",
+        report.external_packages
+    );
+    if report.outside_index > 0 {
+        // The most dangerous line in the output. These edges exist and left
+        // the graph: a workspace package resolving to its built entry point
+        // is the common cause. Every rule below is blind to them, so a
+        // clean run here is not a clean run.
+        println!(
+            "  {} import(s) resolved OUTSIDE the index — no module owns the target, \
+             so no rule could judge them:",
+            report.outside_index
+        );
+        for example in &report.outside_index_examples {
+            println!("      {}", example);
+        }
+    }
     println!("  {} rule(s) loaded", rules.len());
 
     // Per-rule visibility. A rule that matches nothing is indistinguishable
@@ -138,7 +159,7 @@ pub fn run_gate(strict: bool, update_baseline: bool) -> Result<bool, Box<dyn std
             continue;
         };
         println!(
-            "    {}: {} from-file(s), {} to-file(s), {} candidate edge(s){}{}",
+            "    {}: {} from-file(s), {} to-file(s), {} candidate edge(s){}{}{}",
             rule.id,
             status.from_files,
             status.to_files,
@@ -147,6 +168,14 @@ pub fn run_gate(strict: bool, update_baseline: bool) -> Result<bool, Box<dyn std
                 format!(
                     ", {} type-only edge(s) not judged",
                     status.type_only_skipped
+                )
+            } else {
+                String::new()
+            },
+            if status.escaped > 0 {
+                format!(
+                    ", {} edge(s) left the graph — this rule could not judge them",
+                    status.escaped
                 )
             } else {
                 String::new()
