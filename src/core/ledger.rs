@@ -146,13 +146,46 @@ pub fn summary(record: &DecisionRecord, limit: usize) -> String {
     out.trim_end().to_string()
 }
 
+/// Tidy a body without flattening it. Whitespace runs collapse, single line
+/// breaks survive: `- each rejected option` must not come back as one line
+/// of `- first - second`, which reads as a garbled sentence rather than a
+/// list.
 fn bounded(text: &str, limit: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= limit {
-        return flat;
+    let mut out = String::with_capacity(text.len().min(limit + 1));
+    let mut pending_space = false;
+    for character in text.chars() {
+        if character == '\n' || character == '\r' {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+            // Paragraphs survive; runs of blank lines do not.
+            if !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            pending_space = false;
+            continue;
+        }
+        if character.is_whitespace() {
+            pending_space = !out.ends_with('\n');
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(character);
+        if out.chars().count() > limit {
+            break;
+        }
     }
-    let head: String = flat.chars().take(limit).collect();
-    format!("{}…", head.trim_end())
+    let mut trimmed: String = out.chars().take(limit).collect();
+    while trimmed.ends_with(' ') || trimmed.ends_with('\n') {
+        trimmed.pop();
+    }
+    if trimmed.chars().count() < out.trim_end().chars().count() {
+        trimmed.push('…');
+    }
+    trimmed
 }
 
 #[cfg(test)]
@@ -202,11 +235,29 @@ mod tests {
 
     #[test]
     fn a_short_brief_is_left_alone() {
-        assert_eq!(bounded("Drizzle. No second ORM.", 100), "Drizzle. No second ORM.");
         assert_eq!(
-            bounded("line one\nline two", 100),
-            "line one line two",
-            "a brief is one paragraph, not a transcript"
+            bounded("Drizzle. No second ORM.", 100),
+            "Drizzle. No second ORM."
         );
+    }
+
+    /// Rejected options arrive as a markdown list. Flattened onto one line
+    /// they read as one garbled option, which is the worst possible thing
+    /// to hand an agent deciding what not to do.
+    #[test]
+    fn a_list_stays_a_list() {
+        let list = "- each route owns its SQL\n- lint the exceptions away";
+        assert_eq!(bounded(list, 100), list);
+        assert!(
+            bounded(list, 100).contains("\n- lint"),
+            "got:\n{}",
+            bounded(list, 100)
+        );
+    }
+
+    #[test]
+    fn ragged_whitespace_collapses_without_touching_the_lines() {
+        assert_eq!(bounded("line one\n\n\nline two", 100), "line one\n\nline two");
+        assert_eq!(bounded("lots   of\tspace", 100), "lots of space");
     }
 }
