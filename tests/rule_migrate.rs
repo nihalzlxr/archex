@@ -7,8 +7,22 @@ mod common;
 
 use common::{init, two_layer_fixture};
 
+/// Plant a rule the way a pre-2.5 index did. The `rules` table is gone at the
+/// current schema version, so the bridge command is tested against the shape
+/// it actually has to handle: an index that still carries one.
 fn legacy_db_rule(root: &std::path::Path, module: &str, description: &str, pattern: &str) {
     let conn = Connection::open(root.join(".archex/archex.db")).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            module_id INTEGER NOT NULL,
+            rule_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            pattern TEXT
+        )",
+        [],
+    )
+    .unwrap();
     let module_id: i64 = conn
         .query_row(
             "SELECT id FROM modules WHERE name = ?1",

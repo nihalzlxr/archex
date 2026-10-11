@@ -66,10 +66,14 @@ fn modules(root: &std::path::Path) -> Vec<(String, String, String)> {
     rows.map(|r| r.unwrap()).collect()
 }
 
-fn rule_count(root: &std::path::Path) -> i64 {
-    let db = Connection::open(root.join(".archex/archex.db")).unwrap();
-    db.query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))
-        .unwrap()
+/// Rules live in `.archex/rules/*.toml`, never in the database -- the table
+/// itself is gone at the current schema version. "Seeding creates no rules"
+/// is now a property of the rules directory, which is where they would be.
+fn rule_file_count(root: &std::path::Path) -> usize {
+    let dir = root.join(".archex/rules");
+    std::fs::read_dir(dir)
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0)
 }
 
 fn mapped_files(root: &std::path::Path) -> i64 {
@@ -131,7 +135,7 @@ fn generic_seeding_creates_no_rules() {
     plain_repo(root);
     init(root);
 
-    assert_eq!(rule_count(root), 0);
+    assert_eq!(rule_file_count(root), 0);
 }
 
 /// Modules are only names; the index still has to land.
@@ -273,7 +277,7 @@ fn init_twice_does_not_duplicate_generic_modules() {
 
     let names: Vec<String> = modules(root).into_iter().map(|(n, _, _)| n).collect();
     assert_eq!(names, vec!["lib", "src", "tests"]);
-    assert_eq!(rule_count(root), 0);
+    assert_eq!(rule_file_count(root), 0);
 }
 
 /// Re-init must never overwrite a config.toml. The human owns it, and the

@@ -11,6 +11,7 @@
 
 
 use crate::core::config::{Config, ConfigError, Rule, Severity};
+use crate::core::db::ImportKind;
 use crate::core::db::Db;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +48,8 @@ pub struct RuleStatus {
     pub to_files: usize,
     /// Edges between the two sides, before allow_to and test exemptions.
     pub edges: usize,
+    /// Type-only edges this rule did not judge, because it did not ask to.
+    pub type_only_skipped: usize,
     /// One side has no files: almost certainly a typo or a dead layer.
     pub suspicious: bool,
 }
@@ -84,6 +87,9 @@ struct Edge {
     imported_from: String,
     from_module: String,
     to_module: String,
+    /// What kind of edge this is. A type-only edge does not create runtime
+    /// coupling, so a rule skips it unless it opts in.
+    kind: ImportKind,
 }
 
 pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport, ConfigError> {
@@ -125,9 +131,20 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
             .map(|module| db.files_in_module(module).unwrap_or(0))
             .sum();
 
-        let candidates: Vec<&Edge> = edges
+        let between_sides = edges
             .iter()
-            .filter(|e| from_modules.contains(&e.from_module) && to_modules.contains(&e.to_module))
+            .filter(|e| from_modules.contains(&e.from_module) && to_modules.contains(&e.to_module));
+
+        // A type-only edge compiles to nothing. Skipping it is the default,
+        // and the count of what was skipped is reported rather than swallowed:
+        // a rule that quietly judged nothing must never look like a clean run.
+        let type_only_skipped = between_sides
+            .clone()
+            .filter(|e| e.kind == ImportKind::TypeOnly && !boundary.include_type_only)
+            .count();
+
+        let candidates: Vec<&Edge> = between_sides
+            .filter(|e| boundary.include_type_only || e.kind != ImportKind::TypeOnly)
             .collect();
 
         report.rule_status.insert(
@@ -136,6 +153,7 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
                 from_files,
                 to_files,
                 edges: candidates.len(),
+                type_only_skipped,
                 suspicious: from_files == 0 || to_files == 0,
             },
         );
@@ -217,6 +235,7 @@ fn collect_edges(db: &Db) -> Result<(Vec<Edge>, Coverage), ConfigError> {
                 imported_from: import.imported_from,
                 from_module,
                 to_module,
+                kind: import.kind,
             });
         }
     }

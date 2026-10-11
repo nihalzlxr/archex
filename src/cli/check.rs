@@ -138,8 +138,19 @@ pub fn run_gate(strict: bool, update_baseline: bool) -> Result<bool, Box<dyn std
             continue;
         };
         println!(
-            "    {}: {} from-file(s), {} to-file(s), {} candidate edge(s){}",
-            rule.id, status.from_files, status.to_files, status.edges,
+            "    {}: {} from-file(s), {} to-file(s), {} candidate edge(s){}{}",
+            rule.id,
+            status.from_files,
+            status.to_files,
+            status.edges,
+            if status.type_only_skipped > 0 {
+                format!(
+                    ", {} type-only edge(s) not judged",
+                    status.type_only_skipped
+                )
+            } else {
+                String::new()
+            },
             if rule.status == crate::core::config::Status::Retired {
                 " [retired]"
             } else {

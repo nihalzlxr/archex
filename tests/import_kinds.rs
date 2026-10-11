@@ -154,3 +154,61 @@ fn type_only_imports_still_count_as_classified() {
         stdout
     );
 }
+/// `reachable = true` is rejected at validation until the engine computes
+/// transitive closure. A field that is accepted and silently does nothing is
+/// the silently-empty-rule failure arriving through the front door: the rule
+/// would read as transitive while enforcing direct edges only.
+#[test]
+fn reachable_true_is_rejected_until_the_engine_computes_closure() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    import_kind_fixture(root);
+    boundary_rule(root, "reachable = true\n");
+    init(root);
+
+    let out = Command::cargo_bin("archex")
+        .unwrap()
+        .arg("check")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a rule that cannot be honored must not load:\n{}",
+        text
+    );
+    assert!(
+        text.contains("reachable") && text.contains("not supported"),
+        "the error must name the field and why, got:\n{}",
+        text
+    );
+}
+
+/// The gate reports how many type-only edges it did not judge. A rule that
+/// quietly skipped everything must never look like a clean run.
+#[test]
+fn the_gate_reports_type_only_edges_it_did_not_judge() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    import_kind_fixture(root);
+    boundary_rule(root, "");
+    init(root);
+
+    let out = Command::cargo_bin("archex")
+        .unwrap()
+        .arg("check")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("type-only edge(s) not judged"),
+        "skipped edges must be counted, not swallowed:\n{}",
+        stdout
+    );
+}

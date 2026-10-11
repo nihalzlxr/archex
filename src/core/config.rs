@@ -216,6 +216,18 @@ pub struct BoundaryRule {
     /// Anything else the rule should not apply to.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Judge type-only edges too. Off by default: `import type` compiles to
+    /// nothing, so flagging it is a false positive by construction (713 of
+    /// LORB's 10,638 edges). Compile-time coupling is still coupling, which
+    /// is why this is a per-rule choice rather than a hardcoded exemption.
+    #[serde(default)]
+    pub include_type_only: bool,
+    /// Transitive enforcement. Only `false` is accepted today: a field that
+    /// is accepted and silently does nothing is the silently-empty-rule
+    /// failure arriving through the front door. The engine computes direct
+    /// edges only.
+    #[serde(default)]
+    pub reachable: bool,
     pub message: String,
 }
 
@@ -296,6 +308,17 @@ impl Rule {
                     named.join(", ")
                 }
             )));
+        }
+
+        if let Some(boundary) = &self.boundary {
+            if boundary.reachable {
+                return Err(ConfigError(format!(
+                    "rule `{}`: reachable = true is not supported yet — the engine \
+                     judges direct edges only. A rule that reads as transitive while \
+                     enforcing direct edges is worse than no such field.",
+                    self.id
+                )));
+            }
         }
 
         if self.kind.table_name() != present.iter().find(|(_, p)| *p).unwrap().0 {

@@ -11,10 +11,13 @@ fn db_path(root: &Path) -> std::path::PathBuf {
     root.join(".archex/archex.db")
 }
 
-fn rule_count(root: &Path) -> i64 {
-    let conn = rusqlite::Connection::open(db_path(root)).unwrap();
-    conn.query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))
-        .unwrap()
+/// Rules live in files, never in the database: the `rules` table is gone at
+/// the current schema version, and archex inventing a rule for your repo is a
+/// rule you did not choose.
+fn rule_file_count(root: &Path) -> usize {
+    std::fs::read_dir(root.join(".archex/rules"))
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0)
 }
 
 fn counts(root: &Path) -> (i64, i64, i64) {
@@ -73,7 +76,7 @@ fn init_twice_is_idempotent() {
     assert!(first.1 > 0, "symbols should be extracted");
     assert!(first.2 > 0, "imports should be extracted");
     // The curated Next.js seed is gone. Rules are written by humans now.
-    assert_eq!(rule_count(dir.path()), 0, "seeding creates no rules");
+    assert_eq!(rule_file_count(dir.path()), 0, "seeding creates no rules");
     assert!(duplicate_module_names(dir.path()).is_empty(), "no duplicate module names after first init");
 
     // Second init: answer "y" to the reinitialize prompt.
@@ -90,6 +93,6 @@ fn init_twice_is_idempotent() {
         second, first,
         "init run twice must not duplicate modules, symbols, or imports (got {second:?}, expected {first:?})"
     );
-    assert_eq!(rule_count(dir.path()), 0, "re-init must not invent rules");
+    assert_eq!(rule_file_count(dir.path()), 0, "re-init must not invent rules");
     assert!(duplicate_module_names(dir.path()).is_empty(), "no duplicate module names after second init");
 }

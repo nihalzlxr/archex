@@ -38,6 +38,10 @@ pub enum RuleCommands {
         exclude: Vec<String>,
         #[arg(long, default_value_t = false)]
         include_tests: bool,
+        /// Judge type-only edges too. Off by default: `import type` compiles
+        /// to nothing, so flagging it is a false positive by construction.
+        #[arg(long, default_value_t = false)]
+        include_type_only: bool,
 
         // pattern
         #[arg(long)]
@@ -80,6 +84,7 @@ pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
             allow_to,
             exclude,
             include_tests,
+            include_type_only,
             scope,
             mode,
             pattern,
@@ -97,6 +102,7 @@ pub fn run(command: RuleCommands) -> Result<(), Box<dyn std::error::Error>> {
                 allow_to,
                 exclude,
                 include_tests,
+                include_type_only,
                 scope,
                 mode,
                 pattern,
@@ -172,6 +178,7 @@ struct AddArgs {
     allow_to: Vec<String>,
     exclude: Vec<String>,
     include_tests: bool,
+    include_type_only: bool,
     scope: Option<String>,
     mode: Option<String>,
     pattern: Option<String>,
@@ -256,6 +263,7 @@ fn render_rule(
         ("allow-to", !args.allow_to.is_empty()),
         ("exclude", !args.exclude.is_empty()),
         ("include-tests", args.include_tests),
+        ("include-type-only", args.include_type_only),
         ("scope", args.scope.is_some()),
         ("mode", args.mode.is_some()),
         ("pattern", args.pattern.is_some()),
@@ -269,6 +277,7 @@ fn render_rule(
             ("allow-to", true),
             ("exclude", true),
             ("include-tests", true),
+            ("include-type-only", true),
         ],
         Kind::Pattern => &[
             ("scope", true),
@@ -346,6 +355,11 @@ fn render_rule(
             }
             if args.include_tests {
                 body.push_str("include_tests = true\n");
+            }
+            // Default-skip is not worth writing down: an omitted field is the
+            // default, and the diff of a rule change should be the change.
+            if args.include_type_only {
+                body.push_str("include_type_only = true\n");
             }
             if !args.exclude.is_empty() {
                 body.push_str(&format!("exclude = [{}]\n", toml_array(&args.exclude)));

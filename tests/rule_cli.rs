@@ -298,3 +298,58 @@ fn rule_add_pattern_rule_says_it_is_not_enforced_yet() {
 
     assert!(root.join(".archex/rules/no-fetch-in-ui.toml").exists());
 }
+/// The kind column is only reachable from the CLI if the CLI can write the
+/// rule that uses it. `include_type_only` is a boundary-rule field, so a
+/// boundary rule written by hand and by `rule add` must mean the same thing.
+#[test]
+fn rule_add_can_opt_into_type_only_edges() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+    init(root);
+
+    Command::cargo_bin("archex")
+        .unwrap()
+        .args([
+            "rule", "add",
+            "--kind", "boundary",
+            "--id", "ui-no-db-strict",
+            "--from", "ui",
+            "--to", "db",
+            "--include-type-only",
+            "--message", "UI must not import the db layer, type-only or not.",
+        ])
+        .current_dir(root)
+        .assert()
+        .success();
+
+    let body =
+        std::fs::read_to_string(root.join(".archex/rules/ui-no-db-strict.toml")).unwrap();
+    assert!(
+        body.contains("include_type_only = true"),
+        "the opt-in must survive the round trip through the CLI:\n{}",
+        body
+    );
+
+    // And the default must NOT be written down: an omitted field is the
+    // default, so the diff of a rule change is the change.
+    Command::cargo_bin("archex")
+        .unwrap()
+        .args([
+            "rule", "add",
+            "--kind", "boundary",
+            "--id", "ui-no-db-plain",
+            "--from", "ui",
+            "--to", "db",
+            "--message", "Plain boundary rule.",
+        ])
+        .current_dir(root)
+        .assert()
+        .success();
+    let plain = std::fs::read_to_string(root.join(".archex/rules/ui-no-db-plain.toml")).unwrap();
+    assert!(
+        !plain.contains("include_type_only"),
+        "the default must not be written:\n{}",
+        plain
+    );
+}

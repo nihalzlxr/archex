@@ -1,4 +1,4 @@
-use crate::core::db::{Db, Import, Module, Symbol, SymbolType};
+use crate::core::db::{Db, Import, ImportKind, Module, Symbol, SymbolType};
 use crate::core::paths;
 use crate::core::resolve::Resolver;
 use glob::Pattern;
@@ -339,6 +339,14 @@ impl Parser {
                 let names = Self::extract_ts_imported_names(node, content);
 
                 if !imported_from.is_empty() || !names.is_empty() {
+                    // `import type { X } from './y'` compiles to nothing, so it
+                    // cannot create runtime coupling. Everything else is
+                    // classified by the shape of the specifier.
+                    let kind = if Self::has_type_marker(node) {
+                        ImportKind::TypeOnly
+                    } else {
+                        Self::classify_specifier(&imported_from)
+                    };
                     imports.push(Import {
                         id: 0,
                         file_path: file_path.to_string(),
@@ -347,6 +355,7 @@ impl Parser {
                         module_id,
                         resolved_to: None,
                         line_number: node.start_position().row as i64 + 1,
+                        kind,
                     });
                 }
             }
@@ -355,6 +364,11 @@ impl Parser {
                 if let Some(source) = node.child_by_field_name("source") {
                     let imported_from = Self::string_literal_value(&source, content);
                     if !imported_from.is_empty() {
+                        let kind = if Self::has_type_marker(node) {
+                            ImportKind::TypeOnly
+                        } else {
+                            Self::classify_specifier(&imported_from)
+                        };
                         imports.push(Import {
                             id: 0,
                             file_path: file_path.to_string(),
@@ -363,6 +377,7 @@ impl Parser {
                             module_id,
                             resolved_to: None,
                             line_number: node.start_position().row as i64 + 1,
+                            kind,
                         });
                     }
                 }
@@ -378,6 +393,9 @@ impl Parser {
                         module_id,
                         resolved_to: None,
                         line_number: node.start_position().row as i64 + 1,
+                        // Deferred is not detached: a dynamic import is a
+                        // runtime edge, so it counts like any other.
+                        kind: ImportKind::Dynamic,
                     });
                 }
             }
@@ -389,6 +407,46 @@ impl Parser {
                 Self::collect_ts_symbols(&child, content, file_path, module_id, is_route_file, symbols, imports);
             }
         }
+    }
+
+    /// `import type { X } from './y'` and `export type { X } from './y'` put a
+    /// `type` keyword directly after the import/export keyword. Checked
+    /// against the grammar rather than assumed: tree-sitter-typescript emits
+    /// it as a plain `type` node, so looking for an `import_type` node matches
+    /// nothing and every type-only import reads as a runtime edge.
+    fn has_type_marker(node: &tree_sitter::Node) -> bool {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "type" | "import_type" | "export_type" => return true,
+                // Only the marker immediately follows `import`/`export`;
+                // `import { type X } from './y'` is not a type-only edge --
+                // it still imports a runtime binding.
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Specifier shape only. Relative and aliased both point at first-party
+    /// code; a bare specifier is a package. Nothing here guesses whether the
+    /// target is a layer -- that is a module decision, made in config.toml.
+    fn classify_specifier(specifier: &str) -> ImportKind {
+        if specifier.is_empty() {
+            return ImportKind::Unknown;
+        }
+        if specifier.starts_with("./") || specifier.starts_with("../") {
+            return ImportKind::Relative;
+        }
+        // `@/`, `~/`, `#` and bare absolute-looking prefixes are alias
+        // conventions; whether they RESOLVE is the resolver's business.
+        if specifier.starts_with('@') || specifier.starts_with('~') || specifier.starts_with('#') {
+            return ImportKind::Aliased;
+        }
+        if specifier.starts_with('/') {
+            return ImportKind::Aliased;
+        }
+        ImportKind::Package
     }
 
     /// The specifier of an import statement. TypeScript accepts single and
@@ -614,14 +672,26 @@ if kind == "default_import" {
         }
         
         if !imported_from.is_empty() {
+            // Rust: crate-internal paths are first-party; anything else names a
+            // crate. Whether the item is a type or a value is not worth a second
+            // parse, and wrongly exempting an edge is worse than flagging one.
+            let kind = if imported_from.starts_with("crate::")
+                || imported_from.starts_with("super::")
+                || imported_from.starts_with("self::")
+            {
+                ImportKind::Relative
+            } else {
+                ImportKind::Package
+            };
             Some(Import {
                 id: 0,
                 file_path: String::new(),
                 imported_from,
                 imported_names,
                 module_id: 0,
-                        resolved_to: None,
+                resolved_to: None,
                 line_number: node.start_position().row as i64 + 1,
+                kind,
             })
         } else {
             None
@@ -735,6 +805,13 @@ if kind == "default_import" {
         }
         
         if !imported_from.is_empty() {
+            // Python: a leading dot means relative; anything else is a module
+            // path, first-party or not -- the resolver decides.
+            let kind = if imported_from.starts_with('.') {
+                ImportKind::Relative
+            } else {
+                ImportKind::Package
+            };
             Some(Import {
                 id: 0,
                 file_path: String::new(),
@@ -743,6 +820,7 @@ if kind == "default_import" {
                 module_id: 0,
                 resolved_to: None,
                 line_number: node.start_position().row as i64 + 1,
+                kind,
             })
         } else {
             None
@@ -916,4 +994,167 @@ if kind == "default_import" {
     }
 
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a TypeScript snippet and return (specifier, kind) per import edge.
+    fn ts_import_kinds(src: &str) -> Vec<(String, ImportKind)> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        fn walk(
+            node: tree_sitter::Node,
+            src: &str,
+            out: &mut Vec<(String, ImportKind)>,
+        ) {
+            match node.kind() {
+                "import_statement" => {
+                    if let Some(spec) = child_string(node, src) {
+                        let kind = if Parser::has_type_marker(&node) {
+                            ImportKind::TypeOnly
+                        } else {
+                            Parser::classify_specifier(&spec)
+                        };
+                        out.push((spec, kind));
+                    }
+                }
+                "export_statement" => {
+                    if let Some(source) = node.child_by_field_name("source") {
+                        let spec = unquote(
+                            source.utf8_text(src.as_bytes()).unwrap_or_default(),
+                        );
+                        if let Some(spec) = spec {
+                            let kind = if Parser::has_type_marker(&node) {
+                                ImportKind::TypeOnly
+                            } else {
+                                Parser::classify_specifier(&spec)
+                            };
+                            out.push((spec, kind));
+                        }
+                    }
+                }
+                "call_expression" => {
+                    let text = node.utf8_text(src.as_bytes()).unwrap_or_default().to_string();
+                    if text.starts_with("require(") || text.starts_with("import(") {
+                        // The specifier is the quoted argument, not the whole call.
+                        let arg = text
+                            .split_once('(')
+                            .and_then(|(_, rest)| rest.rsplit_once(')').map(|(a, _)| a));
+                        if let Some(spec) = arg.and_then(unquote) {
+                            out.push((spec, ImportKind::Dynamic));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, src, out);
+            }
+        }
+
+        let mut out = Vec::new();
+        walk(tree.root_node(), src, &mut out);
+        out
+    }
+
+    fn child_string(node: tree_sitter::Node, src: &str) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "string" {
+                return unquote(&child.utf8_text(src.as_bytes()).unwrap_or_default());
+            }
+        }
+        None
+    }
+
+    fn unquote(text: &str) -> Option<String> {
+        let t = text.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    }
+
+    #[test]
+    fn classifies_the_five_kinds() {
+        let kinds = ts_import_kinds(
+            "import { a } from './rel';\n\
+             import { b } from '@/aliased';\n\
+             import { c } from 'some-pkg';\n\
+             import type { D } from '../types';\n\
+             export async function go() { return import('./lazy'); }\n",
+        );
+        assert_eq!(
+            kinds,
+            vec![
+                ("./rel".to_string(), ImportKind::Relative),
+                ("@/aliased".to_string(), ImportKind::Aliased),
+                ("some-pkg".to_string(), ImportKind::Package),
+                ("../types".to_string(), ImportKind::TypeOnly),
+                ("./lazy".to_string(), ImportKind::Dynamic),
+            ],
+        );
+    }
+
+    /// The grammar-shape trap: tree-sitter-typescript emits a bare `type`
+    /// node, so a detector looking for `import_type` matches nothing and every
+    /// type-only import is read as a runtime edge.
+    #[test]
+    fn type_only_marker_is_a_bare_type_node() {
+        assert_eq!(
+            ts_import_kinds("import type { Row } from './row';"),
+            vec![("./row".to_string(), ImportKind::TypeOnly)]
+        );
+        assert_eq!(
+            ts_import_kinds("import type Row from './row';"),
+            vec![("./row".to_string(), ImportKind::TypeOnly)]
+        );
+        assert_eq!(
+            ts_import_kinds("export type { Row } from './row';"),
+            vec![("./row".to_string(), ImportKind::TypeOnly)]
+        );
+    }
+
+    /// `import { type X }` still imports a runtime binding; only a
+    /// statement-level `type` marker makes the whole edge type-only.
+    #[test]
+    fn inline_type_specifier_is_not_a_type_only_edge() {
+        let kinds = ts_import_kinds("import { type X, y } from './m';");
+        assert_eq!(kinds, vec![("./m".to_string(), ImportKind::Relative)]);
+    }
+
+    /// Deferred is not detached: a dynamic import is runtime coupling.
+    #[test]
+    fn dynamic_imports_are_runtime_edges() {
+        assert_eq!(
+            ts_import_kinds("const m = await import('./x');"),
+            vec![("./x".to_string(), ImportKind::Dynamic)]
+        );
+        assert_eq!(
+            ts_import_kinds("const y = require('./y');"),
+            vec![("./y".to_string(), ImportKind::Dynamic)]
+        );
+    }
+
+    /// Alias conventions that are not `./` and are not package names must not
+    /// be classified as packages — they resolve to first-party code.
+    #[test]
+    fn alias_conventions_classify_as_aliased() {
+        for spec in ["@/lib/x", "~/lib/x", "#internal", "/abs/path"] {
+            assert_eq!(
+                Parser::classify_specifier(spec),
+                ImportKind::Aliased,
+                "{} should be aliased",
+                spec
+            );
+        }
+    }
 }

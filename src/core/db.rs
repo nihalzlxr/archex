@@ -11,7 +11,7 @@ pub const DB_PATH: &str = ".archex/archex.db";
 /// Bump when the shape of the index changes. On mismatch the cache is dropped
 /// and rebuilt from code -- it is derived, never the source of truth, so a
 /// migration would be code that only ever runs once, on machines nobody has.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
@@ -105,6 +105,7 @@ pub struct ImportEdge {
     pub imported_from: String,
     pub resolved_to: Option<String>,
     pub line_number: i64,
+    pub kind: ImportKind,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,18 +216,6 @@ impl Db {
         )?;
 
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS rules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                module_id INTEGER NOT NULL,
-                rule_type TEXT NOT NULL CHECK(rule_type IN ('forbidden', 'required', 'warning')),
-                description TEXT NOT NULL,
-                pattern TEXT,
-                FOREIGN KEY(module_id) REFERENCES modules(id)
-            )",
-            [],
-        )?;
-
-        conn.execute(
             "CREATE TABLE IF NOT EXISTS file_map (
                 file_path TEXT PRIMARY KEY,
                 module_id INTEGER NOT NULL,
@@ -332,6 +321,7 @@ impl Db {
                 module_id INTEGER NOT NULL,
                 resolved_to TEXT,
                 line_number INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL DEFAULT 'unknown',
                 FOREIGN KEY(module_id) REFERENCES modules(id)
             )",
             [],
@@ -397,11 +387,22 @@ impl Db {
     pub fn get_context_for_file(&self, file_path: &str) -> Result<Option<FileContext>> {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
-        let sql = "SELECT m.name, m.layer, r.rule_type, r.description, r.pattern
+        // The rules table is legacy: gone on any index rebuilt at the current
+        // schema version. Without it there are no DB rules to join, and the
+        // file's committed rules are served from `.archex/rules/` by the
+        // caller instead.
+        let rules_join = if Self::has_table(&conn, "rules")? {
+            ", r.rule_type, r.description, r.pattern\n             LEFT JOIN rules r ON r.module_id = m.id"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT m.name, m.layer{}
              FROM file_map fm
              JOIN modules m ON fm.module_id = m.id
-             LEFT JOIN rules r ON r.module_id = m.id
-             WHERE ";
+             WHERE ",
+            rules_join
+        );
         let mut stmt = conn.prepare(&format!(
             "{}{}",
             sql,
@@ -420,9 +421,10 @@ impl Db {
                 layer = Some(row.get(1)?);
             }
             
-            let rule_type: Option<String> = row.get(2).ok();
-            let description: Option<String> = row.get(3).ok();
-            let pattern: Option<String> = row.get(4).ok();
+            // Columns 2..4 only exist when the legacy join is present.
+            let rule_type: Option<String> = row.get(2).ok().flatten();
+            let description: Option<String> = row.get(3).ok().flatten();
+            let pattern: Option<String> = row.get(4).ok().flatten();
 
             if let (Some(rt), Some(desc)) = (rule_type, description) {
                 rules.push(Rule {
@@ -463,6 +465,7 @@ impl Db {
                 imported_from: i.imported_from,
                 resolved_to: i.resolved_to,
                 line_number: i.line_number,
+                kind: i.kind,
             })
             .collect())
     }
@@ -523,6 +526,11 @@ impl Db {
         let conn = self.lock();
         let tx = conn.unchecked_transaction()?;
         for table in ["file_map", "rules", "symbols", "imports", "modules"] {
+            // `rules` is legacy: absent on any index rebuilt at the current
+            // schema version, and there is nothing of ours in it any more.
+            if !Self::has_table(&conn, table)? {
+                continue;
+            }
             tx.execute(&format!("DELETE FROM {}", table), [])?;
         }
         tx.commit()?;
@@ -544,34 +552,14 @@ impl Db {
         }
     }
 
-    /// Legacy DB rules. Still read by `archex rule migrate` (Step 2.5), which
-    /// converts them into committed files; the table dies with the schema bump.
-    #[allow(dead_code)]
-    pub fn get_rules_for_module(&self, module_id: i64) -> Result<Vec<Rule>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, rule_type, description, pattern FROM rules WHERE module_id = ?1"
-        )?;
-        
-        let rules = stmt.query_map([module_id], |row| {
-            Ok(Rule {
-                id: row.get(0)?,
-                rule_type: RuleType::from(row.get::<_, String>(1)?),
-                description: row.get(2)?,
-                pattern: row.get(3)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-        
-        Ok(rules)
-    }
-
     /// Every legacy DB rule with the name of the module it was attached to.
     /// Legacy rules are keyed by module *name*, which is how the migration maps
     /// them onto config.toml (or refuses, when the name is not in it).
     pub fn all_legacy_rules(&self) -> Result<Vec<LegacyRule>> {
         let conn = self.lock();
+        if !Self::has_table(&conn, "rules")? {
+            return Ok(Vec::new());
+        }
         let mut stmt = conn.prepare(
             "SELECT m.name, r.rule_type, r.description, r.pattern
              FROM rules r JOIN modules m ON r.module_id = m.id
@@ -588,13 +576,25 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// How many rules still live only in the database. Anything above zero
-    /// means rules are being ignored by every path that reads files, so every
-    /// enforcing path says so (see `rule_engine::warn_legacy_db_rules`).
+    /// How many rules still live only in the database. Zero on any index
+    /// rebuilt at the current schema version — the table is gone — which is
+    /// exactly what the warning below should report.
     pub fn legacy_rule_count(&self) -> Result<i64> {
         let conn = self.lock();
+        if !Self::has_table(&conn, "rules")? {
+            return Ok(0);
+        }
         let count = conn.query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))?;
         Ok(count)
+    }
+
+    fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn insert_decision(&self, title: &str, context: Option<&str>, decision: &str) -> Result<i64> {
@@ -732,6 +732,17 @@ impl Db {
             .filter_map(|r| r.ok())
             .collect();
 
+        // Legacy table: absent on any index rebuilt at the current version.
+        if !Self::has_table(&conn, "rules")? {
+            return Ok(Some(ModuleInfo {
+                name: name.to_string(),
+                layer,
+                path_pattern,
+                file_count,
+                files,
+                rules: Vec::new(),
+            }));
+        }
         let mut stmt = conn.prepare(
             "SELECT id, rule_type, description, pattern FROM rules WHERE module_id = ?1"
         )?;
@@ -790,10 +801,13 @@ impl Db {
             }
 
             if score > 0 {
-                // Get rules
-                let mut rule_stmt = conn.prepare(
-                    "SELECT rule_type, description, pattern FROM rules WHERE module_id = ?1"
-                )?;
+                // Get rules (legacy table; absent at the current schema version)
+                let mut rule_stmt = match Self::has_table(&conn, "rules")? {
+                    true => conn.prepare(
+                        "SELECT rule_type, description, pattern FROM rules WHERE module_id = ?1"
+                    )?,
+                    false => continue,
+                };
                 let rules: Vec<String> = rule_stmt
                     .query_map([id], |row| {
                         let rt: String = row.get(0)?;
@@ -843,8 +857,8 @@ impl Db {
         for import in imports {
             let names_json = serde_json::to_string(&import.imported_names).unwrap_or_else(|_| "[]".to_string());
             tx.execute(
-                "INSERT INTO imports (file_path, imported_from, imported_names, module_id, resolved_to, line_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (import.file_path.as_str(), import.imported_from.as_str(), names_json.as_str(), import.module_id, import.resolved_to.as_deref(), import.line_number),
+                "INSERT INTO imports (file_path, imported_from, imported_names, module_id, resolved_to, line_number, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (import.file_path.as_str(), import.imported_from.as_str(), names_json.as_str(), import.module_id, import.resolved_to.as_deref(), import.line_number, import.kind.as_str()),
             )?;
         }
         tx.commit()?;
@@ -914,7 +928,7 @@ impl Db {
         let conn = self.lock();
         let file_path = self.normalize(file_path);
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, file_path, imported_from, imported_names, module_id, resolved_to, line_number FROM imports WHERE {}",
+            "SELECT id, file_path, imported_from, imported_names, module_id, resolved_to, line_number, kind FROM imports WHERE {}",
             Self::path_match("file_path")
         ))?;
         let imports = stmt.query_map([&file_path], |row| {
@@ -928,6 +942,7 @@ impl Db {
                 module_id: row.get(4)?,
                 resolved_to: row.get(5)?,
                 line_number: row.get(6)?,
+                kind: ImportKind::from(row.get::<_, String>(7)?.as_str()),
             })
         })?
         .filter_map(|r| r.ok())
@@ -1106,6 +1121,53 @@ pub struct Import {
     /// 1-based line of the import statement. A violation with a file and no
     /// line is a finding nobody can act on.
     pub line_number: i64,
+    /// What kind of edge this is. Type-only edges do not create runtime
+    /// coupling, so boundary rules skip them unless they ask not to.
+    pub kind: ImportKind,
+}
+
+/// How an import reaches its target. Classification is syntax-only on purpose:
+/// a manifest-driven guess is how a guard cries wolf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ImportKind {
+    /// `import { x } from './y'` — a runtime edge.
+    Relative,
+    /// `@/lib/x`, `~/x`, or a configured tsconfig alias.
+    Aliased,
+    /// `import { x } from 'some-package'`.
+    Package,
+    /// `import type { X } from './y'` — compiles to nothing.
+    TypeOnly,
+    /// `require('./y')` or `await import('./y')` — runtime coupling, deferred.
+    Dynamic,
+    /// Recorded before this column existed, or a form we do not classify.
+    Unknown,
+}
+
+impl ImportKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImportKind::Relative => "relative",
+            ImportKind::Aliased => "aliased",
+            ImportKind::Package => "package",
+            ImportKind::TypeOnly => "type_only",
+            ImportKind::Dynamic => "dynamic",
+            ImportKind::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<&str> for ImportKind {
+    fn from(s: &str) -> Self {
+        match s {
+            "relative" => ImportKind::Relative,
+            "aliased" => ImportKind::Aliased,
+            "package" => ImportKind::Package,
+            "type_only" => ImportKind::TypeOnly,
+            "dynamic" => ImportKind::Dynamic,
+            _ => ImportKind::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1154,6 +1216,7 @@ mod tests {
             module_id,
             resolved_to: None,
             line_number: 1,
+            kind: ImportKind::Aliased,
         }])
         .expect("insert imports");
         db
