@@ -49,6 +49,25 @@ pub enum Author {
     Agent,
 }
 
+impl DecisionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecisionStatus::Proposed => "proposed",
+            DecisionStatus::Accepted => "accepted",
+            DecisionStatus::Superseded => "superseded",
+        }
+    }
+}
+
+impl Author {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Author::Human => "human",
+            Author::Agent => "agent",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DecisionError(pub String);
 
@@ -72,10 +91,6 @@ pub struct Decision {
 }
 
 impl Decision {
-    pub fn parse_str(body: &str) -> Result<Self, DecisionError> {
-        Self::parse_named("", body)
-    }
-
     /// Parse a file whose name is part of its identity: the name must carry
     /// the same ULID the frontmatter claims.
     pub fn parse_named(file_name: &str, body: &str) -> Result<Self, DecisionError> {
@@ -305,6 +320,108 @@ pub fn is_ulid(value: &str) -> bool {
     bytes.iter().all(|b| ALPHABET.contains(b))
 }
 
+/// A fresh id for a decision written right now: 48-bit millisecond
+/// timestamp, 80 bits of randomness, Crockford base32. Lexical order is
+/// chronological order, so `ls` and `git log` tell you which decision is
+/// newer without reading a timestamp.
+pub fn new_ulid() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    encode_ulid(millis, random_bytes())
+}
+
+fn encode_ulid(timestamp_ms: u64, randomness: [u8; 10]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut entropy: u128 = 0;
+    for byte in randomness {
+        entropy = (entropy << 8) | byte as u128;
+    }
+    // 48-bit timestamp in the high bits, 80 bits of entropy below it.
+    let mut value: u128 = (((timestamp_ms as u128) & 0xFFFF_FFFF_FFFF) << 80) | entropy;
+    let mut chars = [b'0'; 26];
+    for slot in chars.iter_mut().rev() {
+        *slot = ALPHABET[(value & 0x1f) as usize];
+        value >>= 5;
+    }
+    String::from_utf8(chars.to_vec()).expect("Crockford base32 is ASCII")
+}
+
+/// The current instant, in the one shape `recorded_at` accepts.
+pub fn now_rfc3339() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    format_rfc3339(seconds)
+}
+
+fn format_rfc3339(unix_seconds: i64) -> String {
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds_of_day = unix_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        seconds_of_day / 3600,
+        (seconds_of_day % 3600) / 60,
+        seconds_of_day % 60
+    )
+}
+
+/// Days since 1970-01-01 to a calendar date (Howard Hinnant's algorithm).
+/// Written out because chrono is not a dependency of a tool that only ever
+/// writes one timestamp field.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// 80 bits of randomness for a ULID. `/dev/urandom` where it exists; where
+/// it does not, the clock, the pid and a counter — weaker, and documented
+/// as weaker, because a decision id only has to not collide on one machine.
+fn random_bytes() -> [u8; 10] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+        let mut bytes = [0u8; 10];
+        if std::io::Read::read_exact(&mut file, &mut bytes).is_ok() {
+            return bytes;
+        }
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seed = [
+        nanos.to_le_bytes().to_vec(),
+        std::process::id().to_le_bytes().to_vec(),
+        COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes().to_vec(),
+    ]
+    .concat();
+
+    let mut bytes = [0u8; 10];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = crate::core::hash::content_hash(&seed[index..]).as_bytes()[0];
+    }
+    bytes
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ`, and the fields must be real ones. Deliberately
 /// strict: offsets and fractional seconds are legal RFC 3339 but the ledger
 /// writes one shape, so that `ls` and `git log` agree on ordering.
@@ -463,7 +580,7 @@ Prisma — slower cold starts; a second query builder in the tree.
     }
 
     fn parse(body: &str) -> Result<Decision, DecisionError> {
-        Decision::parse_str(body)
+        Decision::parse_named("", body)
     }
 
     #[test]
@@ -640,5 +757,44 @@ fn a_supersedes_entry_that_points_at_nothing_is_an_error() {
 
         let err = chain_heads(&[first, second]).expect_err("cycle must be refused");
         assert!(err.to_string().contains("supersedes"), "{}", err);
+    }
+
+    #[test]
+    fn a_generated_id_is_a_ulid_and_sorts_by_time() {
+        let first = new_ulid();
+        assert!(is_ulid(&first), "generated {} is not a ULID", first);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = new_ulid();
+        assert!(is_ulid(&second));
+        assert_ne!(first, second, "two ids in a row must not collide");
+        assert!(
+            first < second,
+            "ULIDs must sort chronologically: {} !< {}",
+            first,
+            second
+        );
+        // The first ten characters ARE the timestamp. If they do not move
+        // when the clock does, ordering is luck, not design.
+        assert_ne!(
+            &first[..10],
+            &second[..10],
+            "the timestamp prefix must carry the time: {} vs {}",
+            first,
+            second
+        );
+    }
+
+    #[test]
+    fn the_epoch_formats_as_the_epoch() {
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(1_762_000_000), "2025-11-01T12:26:40Z");
+    }
+
+    /// `recorded_at` is compared and sorted as text in git and in the
+    /// index, so the formatter must only ever produce the accepted shape.
+    #[test]
+    fn now_is_stampable_and_round_trips_validation() {
+        let stamp = now_rfc3339();
+        assert!(is_rfc3339_utc(&stamp), "generated {} was refused", stamp);
     }
 }

@@ -34,9 +34,11 @@ enum Commands {
         #[command(subcommand)]
         command: cli::rule::RuleCommands,
     },
-    Decision {
+    /// Import committed ledger records into the local index
+    Sync,
+    Decide {
         #[command(subcommand)]
-        command: cli::decision::DecisionCommands,
+        command: cli::decide::DecideCommands,
     },
 }
 
@@ -80,8 +82,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Decision { command } => {
-            if let Err(e) = cli::decision::run(command) {
+        Commands::Sync => {
+            let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            if let Err(e) = cli::sync::run(&root) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Decide { command } => {
+            if let Err(e) = cli::decide::run(command) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

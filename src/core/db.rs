@@ -11,7 +11,7 @@ pub const DB_PATH: &str = ".archex/archex.db";
 /// Bump when the shape of the index changes. On mismatch the cache is dropped
 /// and rebuilt from code -- it is derived, never the source of truth, so a
 /// migration would be code that only ever runs once, on machines nobody has.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
@@ -106,6 +106,29 @@ pub struct ImportEdge {
     pub resolved_to: Option<String>,
     pub line_number: i64,
     pub kind: ImportKind,
+}
+
+/// A decision as the index knows it. The committed markdown file is the
+/// record; this row is a cache of it, keyed by the ULID the file carries.
+#[derive(Debug, Clone)]
+pub struct DecisionRecord {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+    pub status: String,
+    pub author: String,
+    pub scope: Vec<String>,
+    pub supersedes: Vec<String>,
+    pub task: Option<String>,
+    pub recorded_at: String,
+    pub context: String,
+    pub decision: String,
+    pub alternatives: String,
+    pub path: String,
+    pub content_hash: String,
+    /// Derived from the supersedes chain at sync time, never read from the
+    /// file: a record cannot vouch for its own replacement.
+    pub is_head: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,13 +248,27 @@ impl Db {
             [],
         )?;
 
+        // Decisions are committed markdown. This table is a cache of
+        // `.archex/decisions/*.md`, keyed by the ULID in the file name and
+        // stamped with the file's content hash so sync can import only what
+        // changed. `is_head` is derived from the supersedes chain.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL,
                 title TEXT NOT NULL,
-                context TEXT,
-                decision TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                status TEXT NOT NULL,
+                author TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT '[]',
+                supersedes TEXT NOT NULL DEFAULT '[]',
+                task TEXT,
+                recorded_at TEXT NOT NULL,
+                context TEXT NOT NULL DEFAULT '',
+                decision TEXT NOT NULL DEFAULT '',
+                alternatives TEXT NOT NULL DEFAULT '',
+                path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                is_head INTEGER NOT NULL DEFAULT 1
             )",
             [],
         )?;
@@ -597,65 +634,131 @@ impl Db {
         Ok(count > 0)
     }
 
-    pub fn insert_decision(&self, title: &str, context: Option<&str>, decision: &str) -> Result<i64> {
+    /// Every decision in the index, newest first.
+    #[allow(dead_code)] // consumed by the Step 3.3 injection path
+    pub fn indexed_decisions(&self) -> Result<Vec<DecisionRecord>> {
         let conn = self.lock();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        
+        let mut stmt = conn.prepare(
+            "SELECT id, slug, title, status, author, scope, supersedes, task, recorded_at,
+                    context, decision, alternatives, path, content_hash, is_head
+             FROM decisions ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::decision_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    #[allow(dead_code)] // consumed by the Step 3.3 injection path
+    fn decision_row(row: &rusqlite::Row<'_>) -> Result<DecisionRecord> {
+        let scope: String = row.get(5)?;
+        let supersedes: String = row.get(6)?;
+        Ok(DecisionRecord {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            title: row.get(2)?,
+            status: row.get(3)?,
+            author: row.get(4)?,
+            scope: serde_json::from_str(&scope).unwrap_or_default(),
+            supersedes: serde_json::from_str(&supersedes).unwrap_or_default(),
+            task: row.get(7)?,
+            recorded_at: row.get(8)?,
+            context: row.get(9)?,
+            decision: row.get(10)?,
+            alternatives: row.get(11)?,
+            path: row.get(12)?,
+            content_hash: row.get(13)?,
+            is_head: row.get::<_, i64>(14)? != 0,
+        })
+    }
+
+    pub fn upsert_decision(&self, record: &DecisionRecord) -> Result<()> {
+        let conn = self.lock();
         conn.execute(
-            "INSERT INTO decisions (title, context, decision, created_at) VALUES (?1, ?2, ?3, ?4)",
-            (title, context, decision, now),
+            "INSERT INTO decisions (
+                id, slug, title, status, author, scope, supersedes, task, recorded_at,
+                context, decision, alternatives, path, content_hash, is_head
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(id) DO UPDATE SET
+                slug = ?2, title = ?3, status = ?4, author = ?5, scope = ?6,
+                supersedes = ?7, task = ?8, recorded_at = ?9, context = ?10,
+                decision = ?11, alternatives = ?12, path = ?13, content_hash = ?14",
+            rusqlite::params![
+                record.id,
+                record.slug,
+                record.title,
+                record.status,
+                record.author,
+                serde_json::to_string(&record.scope).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&record.supersedes).unwrap_or_else(|_| "[]".to_string()),
+                record.task,
+                record.recorded_at,
+                record.context,
+                record.decision,
+                record.alternatives,
+                record.path,
+                record.content_hash,
+                i64::from(record.is_head),
+            ],
         )?;
-        Ok(conn.last_insert_rowid())
+        Ok(())
     }
 
-    pub fn list_decisions(&self, limit: usize) -> Result<Vec<(i64, String, Option<String>, String, i64)>> {
+    /// (path, content hash) of everything the index holds. sync diffs the
+    /// committed files against this: same path and same hash means the file
+    /// has not changed and is not read again.
+    pub fn decision_index(&self) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, context, decision, created_at FROM decisions ORDER BY created_at DESC LIMIT ?1"
-        )?;
-        
-        let rows = stmt.query_map([limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-        
+        let mut stmt = conn.prepare("SELECT path, content_hash FROM decisions")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(rows)
     }
 
-    pub fn search_decisions_db(&self, query: &str) -> Result<Vec<(i64, String, Option<String>, String, i64)>> {
+    pub fn delete_decision_at_path(&self, path: &str) -> Result<()> {
         let conn = self.lock();
-        let pattern = format!("%{}%", query.to_lowercase());
-        
-        let mut stmt = conn.prepare(
-            "SELECT id, title, context, decision, created_at FROM decisions 
-             WHERE LOWER(title) LIKE ?1 OR LOWER(context) LIKE ?1 OR LOWER(decision) LIKE ?1
-             ORDER BY created_at DESC LIMIT 20"
-        )?;
-        
-        let rows = stmt.query_map([&pattern], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-        
-        Ok(rows)
+        conn.execute("DELETE FROM decisions WHERE path = ?1", [path])?;
+        Ok(())
     }
+
+    /// Replace the derived head set. Every record not listed stops being
+    /// current: this is where `superseded` comes from, because a record
+    /// cannot be trusted to declare its own replacement.
+    pub fn set_decision_heads(&self, heads: &[String]) -> Result<()> {
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("UPDATE decisions SET is_head = 0", [])?;
+        for id in heads {
+            tx.execute("UPDATE decisions SET is_head = 1 WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The current decisions whose scope covers this file: its module by
+    /// name, or its layer, so a decision about "all of db" reaches every
+    /// file in db without naming each one.
+    #[allow(dead_code)] // consumed by the Step 3.3 injection path
+    pub fn decisions_for_scope(&self, module: &str, layer: &str) -> Result<Vec<DecisionRecord>> {
+        let heads: Vec<DecisionRecord> = self
+            .indexed_decisions()?
+            .into_iter()
+            .filter(|record| record.is_head)
+            .collect();
+        Ok(heads
+            .into_iter()
+            .filter(|record| {
+                record
+                    .scope
+                    .iter()
+                    .any(|entry| entry == module || (!layer.is_empty() && entry == layer))
+            })
+            .collect())
+    }
+
 
     /// In-memory database for tests. No journal for `:memory:`.
     #[cfg(test)]
@@ -962,6 +1065,9 @@ impl Db {
         Ok(())
     }
 
+    /// Keyword lookup over the decision index. Only `create_plan` — a tool
+    /// scheduled for removal in Step 4 — still calls this; the ledger's real
+    /// read path is scope-based injection, not keyword search.
     pub fn search_decisions(&self, keywords: &[String]) -> Result<Vec<(String, String, String)>> {
         let conn = self.lock();
         if keywords.is_empty() {
@@ -971,10 +1077,10 @@ impl Db {
         let pattern = keywords.iter()
             .map(|k| format!("%{}%", k.to_lowercase()))
             .collect::<Vec<_>>();
-        
+
         let conditions: Vec<String> = (0..keywords.len()).map(|_| "LOWER(title) LIKE ? OR LOWER(context) LIKE ?".to_string()).collect();
         let query = format!(
-            "SELECT title, context, decision FROM decisions WHERE {} ORDER BY created_at DESC LIMIT 10",
+            "SELECT title, context, decision FROM decisions WHERE {} ORDER BY recorded_at DESC LIMIT 10",
             conditions.join(" OR ")
         );
 

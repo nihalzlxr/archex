@@ -10,7 +10,7 @@ use common::{init, two_layer_fixture};
 const A: &str = "01J8K2A7B3C4D5E6F7G8H9J0KM";
 const B: &str = "01J8K2A7B3C4D5E6F7G8H9J0NN";
 
-fn decision_file(id: &str, slug: &str, supersedes: &str, scope: &str) -> String {
+fn decision_file(id: &str, supersedes: &str, scope: &str) -> String {
     format!(
         r#"---
 schema_version = 1
@@ -41,7 +41,7 @@ fn write_decision(root: &Path, id: &str, slug: &str, supersedes: &str, scope: &s
     let dir = root.join(".archex/decisions");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{}-{}.md", id, slug));
-    fs::write(&path, decision_file(id, slug, supersedes, scope)).unwrap();
+    fs::write(&path, decision_file(id, supersedes, scope)).unwrap();
     path.to_string_lossy().to_string()
 }
 
@@ -75,7 +75,7 @@ fn sync_imports_decision_files_into_the_index() {
 
     let out = sync(root);
     assert!(
-        out.contains("1 imported") || out.contains("1 decision imported"),
+        out.contains("1 decision imported"),
         "sync must say what it imported, got:\n{}",
         out
     );
@@ -92,12 +92,12 @@ fn sync_twice_reports_nothing_to_do() {
 
     let second = sync(root);
     assert!(
-        second.contains("1 unchanged"),
+        second.contains("1 decision unchanged"),
         "a second sync must recognize the file is already imported, got:\n{}",
         second
     );
     assert!(
-        !second.contains("1 imported"),
+        !second.contains("imported") || second.contains("0 decisions imported"),
         "a second sync must import nothing, got:\n{}",
         second
     );
@@ -143,7 +143,7 @@ fn sync_drops_a_deleted_decision_from_the_index() {
     fs::remove_file(&path).unwrap();
     let out = sync(root);
     assert!(
-        out.contains("1 removed"),
+        out.contains("1 decision removed"),
         "a deleted record must leave the index, got:\n{}",
         out
     );
@@ -162,7 +162,7 @@ fn sync_resolves_the_chain_and_serves_only_its_head() {
 
     let out = sync(root);
     assert!(
-        out.contains("1 superseded"),
+        out.contains("1 decision superseded"),
         "the replaced decision must be counted as superseded, got:\n{}",
         out
     );

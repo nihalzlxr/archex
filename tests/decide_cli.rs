@@ -80,7 +80,11 @@ fn decide_add_writes_a_file_the_validator_accepts() {
             "db",
         ],
     );
-    assert!(out.contains("wrote"), "must say it wrote a file, got:\n{}", out);
+    assert!(
+        out.contains("Decision written"),
+        "must say it wrote a file, got:\n{}",
+        out
+    );
 
     let dir_path = root.join(".archex/decisions");
     let written: Vec<std::path::PathBuf> = fs::read_dir(&dir_path)
