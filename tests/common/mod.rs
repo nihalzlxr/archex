@@ -67,3 +67,76 @@ pub fn fixture_project(root: &Path) {
     )
     .unwrap();
 }
+
+/// Two-layer fixture: a committed config.toml and one real cross-boundary
+/// import. NO rules — tests write or add the rules they exercise, so a rule's
+/// absence is always visible in the test body.
+pub fn two_layer_fixture(root: &Path) {
+    let archex = root.join(".archex");
+    fs::create_dir_all(archex.join("rules")).unwrap();
+    fs::create_dir_all(root.join("src/components")).unwrap();
+    fs::create_dir_all(root.join("src/db")).unwrap();
+
+    fs::write(
+        archex.join("config.toml"),
+        r#"schema_version = 1
+name = "fixture"
+layers = ["ui", "db"]
+
+[[module]]
+name = "components"
+layer = "ui"
+path = "src/components/**"
+
+[[module]]
+name = "db"
+layer = "db"
+path = "src/db/**"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/db/client.ts"),
+        "export function client() {\n  return null;\n}\n",
+    )
+    .unwrap();
+
+    // A real value import across the boundary: the violation every rule test
+    // in this fixture hunts.
+    fs::write(
+        root.join("src/components/Widget.tsx"),
+        "import { client } from '../db/client';\nexport function Widget() {\n  return client();\n}\n",
+    )
+    .unwrap();
+}
+
+/// The boundary rule used by the gate/advisory/MCP agreement tests.
+pub fn ui_no_db_rule(root: &Path) {
+    fs::write(
+        root.join(".archex/rules/ui-no-db.toml"),
+        r#"schema_version = 1
+id = "ui-no-db"
+status = "accepted"
+kind = "boundary"
+severity = "error"
+
+[boundary]
+from_layer = "ui"
+to_layer = "db"
+message = "UI must not import the db layer. Go through services."
+"#,
+    )
+    .unwrap();
+}
+
+pub fn init(root: &Path) {
+    use assert_cmd::Command;
+    Command::cargo_bin("archex")
+        .unwrap()
+        .arg("init")
+        .current_dir(root)
+        .write_stdin("")
+        .assert()
+        .success();
+}

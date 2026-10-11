@@ -7,73 +7,7 @@ use tempfile::TempDir;
 
 mod common;
 
-use common::fixture_project;
-
-/// Two-layer fixture with a committed boundary rule, mirroring
-/// `advisory_matches_gate`. Kept local rather than shared because the MCP
-/// server needs its own process per test.
-fn two_layer_fixture(root: &Path) {
-    let archex = root.join(".archex");
-    std::fs::create_dir_all(archex.join("rules")).unwrap();
-    std::fs::create_dir_all(root.join("src/components")).unwrap();
-    std::fs::create_dir_all(root.join("src/db")).unwrap();
-
-    std::fs::write(
-        archex.join("config.toml"),
-        r#"schema_version = 1
-name = "fixture"
-layers = ["ui", "db"]
-
-[[module]]
-name = "components"
-layer = "ui"
-path = "src/components/**"
-
-[[module]]
-name = "db"
-layer = "db"
-path = "src/db/**"
-"#,
-    )
-    .unwrap();
-
-    std::fs::write(
-        archex.join("rules/ui-no-db.toml"),
-        r#"schema_version = 1
-id = "ui-no-db"
-status = "accepted"
-kind = "boundary"
-severity = "error"
-
-[boundary]
-from_layer = "ui"
-to_layer = "db"
-message = "UI must not import the db layer. Go through services."
-"#,
-    )
-    .unwrap();
-
-    std::fs::write(
-        root.join("src/db/client.ts"),
-        "export function client() {\n  return null;\n}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("src/components/Widget.tsx"),
-        "import { client } from '../db/client';\nexport function Widget() {\n  return client();\n}\n",
-    )
-    .unwrap();
-}
-
-fn init(root: &Path) {
-    Command::cargo_bin("archex")
-        .unwrap()
-        .arg("init")
-        .current_dir(root)
-        .write_stdin("")
-        .assert()
-        .success();
-}
+use common::{init, two_layer_fixture, ui_no_db_rule};
 
 /// Drives `archex serve` over stdio with hand-written JSON-RPC and returns
 /// everything the server wrote for the tool call.
@@ -159,6 +93,7 @@ fn mcp_check_drift_agrees_with_the_gate() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     two_layer_fixture(root);
+    ui_no_db_rule(root);
     init(root);
 
     let out = call_mcp_tool(
@@ -186,6 +121,7 @@ fn mcp_check_drift_is_quiet_on_a_clean_file() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     two_layer_fixture(root);
+    ui_no_db_rule(root);
     init(root);
 
     let out = call_mcp_tool(
@@ -208,9 +144,8 @@ fn the_fixture_is_still_a_real_violation_for_the_gate() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     two_layer_fixture(root);
+    ui_no_db_rule(root);
     init(root);
-
-    let _ = fixture_project; // keep the shared fixture import meaningful
 
     Command::cargo_bin("archex")
         .unwrap()

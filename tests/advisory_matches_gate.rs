@@ -1,87 +1,19 @@
-use std::fs;
 use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-/// A two-layer fixture with a committed config.toml and a committed boundary
-/// rule. `Widget.tsx` violates `ui-no-db` (a value import across the boundary);
-/// `client.ts` is the target side and violates nothing.
-fn two_layer_fixture(root: &Path) {
-    let archex = root.join(".archex");
-    fs::create_dir_all(archex.join("rules")).unwrap();
-    fs::create_dir_all(root.join("src/components")).unwrap();
-    fs::create_dir_all(root.join("src/db")).unwrap();
+mod common;
 
-    fs::write(
-        archex.join("config.toml"),
-        r#"schema_version = 1
-name = "fixture"
-layers = ["ui", "db"]
+use common::{init, two_layer_fixture, ui_no_db_rule};
 
-[[module]]
-name = "components"
-layer = "ui"
-path = "src/components/**"
-
-[[module]]
-name = "db"
-layer = "db"
-path = "src/db/**"
-"#,
-    )
-    .unwrap();
-
-    fs::write(
-        archex.join("rules/ui-no-db.toml"),
-        r#"schema_version = 1
-id = "ui-no-db"
-status = "accepted"
-kind = "boundary"
-severity = "error"
-
-[boundary]
-from_layer = "ui"
-to_layer = "db"
-message = "UI must not import the db layer. Go through services."
-"#,
-    )
-    .unwrap();
-
-    fs::write(
-        root.join("src/db/client.ts"),
-        "export function client() {\n  return null;\n}\n",
-    )
-    .unwrap();
-
-    // A real value import across the boundary: this is the violation.
-    fs::write(
-        root.join("src/components/Widget.tsx"),
-        "import { client } from '../db/client';\nexport function Widget() {\n  return client();\n}\n",
-    )
-    .unwrap();
-}
-
-fn init(root: &Path) {
-    Command::cargo_bin("archex")
-        .unwrap()
-        .arg("init")
-        .current_dir(root)
-        .write_stdin("")
-        .assert()
-        .success();
-}
-
-/// The exit test for Step 2.5 item 1: the per-file advisory result for X
-/// equals the gate's findings filtered to X, measured on a fixture where X
-/// contains a violation. Advisory and gate must never disagree, or agents
-/// learn to distrust the advisory.
 #[test]
 fn advisory_matches_gate_filtered_to_the_file() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     two_layer_fixture(root);
+    ui_no_db_rule(root);
     init(root);
 
     let violating = "src/components/Widget.tsx";
