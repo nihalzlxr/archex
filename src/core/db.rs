@@ -635,7 +635,6 @@ impl Db {
     }
 
     /// Every decision in the index, newest first.
-    #[allow(dead_code)] // consumed by the Step 3.3 injection path
     pub fn indexed_decisions(&self) -> Result<Vec<DecisionRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -650,7 +649,6 @@ impl Db {
         Ok(rows)
     }
 
-    #[allow(dead_code)] // consumed by the Step 3.3 injection path
     fn decision_row(row: &rusqlite::Row<'_>) -> Result<DecisionRecord> {
         let scope: String = row.get(5)?;
         let supersedes: String = row.get(6)?;
@@ -741,7 +739,6 @@ impl Db {
     /// The current decisions whose scope covers this file: its module by
     /// name, or its layer, so a decision about "all of db" reaches every
     /// file in db without naming each one.
-    #[allow(dead_code)] // consumed by the Step 3.3 injection path
     pub fn decisions_for_scope(&self, module: &str, layer: &str) -> Result<Vec<DecisionRecord>> {
         let heads: Vec<DecisionRecord> = self
             .indexed_decisions()?
