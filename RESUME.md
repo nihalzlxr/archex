@@ -8,7 +8,9 @@ An architecture ledger plus an enforcement gate for AI coding agents. One
 Rust binary, local-first, vendor-neutral. It answers two things teams cannot
 get today: **REMEMBER** (why the code is built this way, handed to every
 agent session) and **BLOCK** (changes that break the architecture, in CI,
-with file and line numbers). Steps 0–3 are built; retrieval (Step 4) is not.
+with file and line numbers). Steps 0–3 are built. What is missing is
+**adoption**, not capability: the forced loop, and drafting so nobody has
+to hand-author a rule.
 
 ## Where we are
 
@@ -19,15 +21,23 @@ with file and line numbers). Steps 0–3 are built; retrieval (Step 4) is not.
 | 2 — the gate | ✅ exit test passed on **LORB**: 0 false positives, 5 real violations found |
 | 2.5 — one truth for rules | ✅ advisory == gate == MCP, `rules` table deleted, import kinds shipped |
 | 3 — the ledger | ✅ exit test passed: an agent records a decision, a *new* server process serves it |
-| 4 — retrieval surface | ⬜ not started |
+| 3.5–4 — adoption chain | 🔴 **this is the work now** — three defects red, then `proposed`=report-only, then the forced loop, then drafting. See PLAN §11 |
+| 4 — retrieval surface | ⬜ after the adoption chain. Retrieval is not what the forced loop needs |
 | 5 — conditional | ⬜ conditional |
 
-**235 tests. `cargo test` must stay green. `cargo build` must stay warning-free.**
+**First run on real repos found the adoption cliff.** On fitness and LORB
+the gate and ledger work, but `init` drafts one module per top-level
+directory — so on a flat repo there are no boundaries, no boundary rule is
+expressible, and `check` prints "0 rule(s) loaded. No violations." A user
+who has to hand-author rules before anything happens will not adopt this.
+That is why 3.6–3.12 exist and why they precede retrieval.
+
+**241 tests. `cargo test` must stay green. `cargo build` must stay warning-free.**
 
 ## Commands
 
 ```bash
-cargo test                    # 235 tests
+cargo test                    # 241 tests
 cargo build                   # zero warnings is the bar, not a nice-to-have
 cargo run -- init             # draft .archex/config.toml if absent, then index
 cargo run -- check            # the gate: whole repo, exit 1 on a new violation
@@ -50,35 +60,38 @@ ARCHEX_EVAL_REPO=/tmp/fitness-eval ARCHEX_EVAL_N=20 \
 
 ## The next task, in full
 
-**Step 4 — the retrieval surface.** The ledger now knows *why*; Step 1
-measured that archex loses to `grep` at finding *where* (Hit@3 17.6% vs
-29.4%). That gap is the whole remaining product.
+**Step 3.6 — finish the three defects.** Red tests are committed; the
+fixes are not. All three make a number archex prints wrong.
 
-Build order, smallest first:
+1. **Python and Rust imports are destroyed.** Both extractors build
+   `Import { file_path: String::new(), module_id: 0, .. }`. The imports
+   table has `FOREIGN KEY(module_id)`, foreign keys are ON, module ids
+   start at 1 — so the insert fails for the whole file's batch, the error
+   is dropped with `.ok()` (`parser.rs` scan loop), and `init` still counts
+   them in "Imports extracted". **Fix:** normalize `file_path` and
+   `module_id` on every returned import in
+   `extract_symbols_and_imports`, so no collector can forget again.
+2. **`.tsx`/`.jsx` parse with the wrong grammar.** `LANGUAGE_TYPESCRIPT`
+   has zero JSX node types; `LANGUAGE_TSX` exists and is never used.
+   **Fix:** dispatch on the extension. Verify with the three-JSX-function
+   fixture in `tests/graph_holes.rs`.
+3. **`is_route_file` reads the absolute path**, with `&&` binding tighter
+   than `||` so `/app/api/` matches helpers next to route files.
+   **Fix:** hand it the repo-relative path and parenthesize the filename
+   clause. Unit tests are in `src/core/parser.rs`.
 
-1. **`decide search` over the ledger index.** Decisions are indexed but not
-   searchable; scope injection only answers "what applies to this file".
-   FTS5 over the decisions table, the same token discipline Step 1 used for
-   symbols (word-split, camelCase-aware) — the harness already exists in
-   `core::eval`, so the numbers are comparable rather than invented.
-2. **`search` / `traverse` / `read` MCP tools** (PLAN §10, Step 4 column),
-   with **token budgets** and **stable ordering**. Stable means: the same
-   query against the same index returns the same order, every time. An agent
-   that gets a different list twice stops trusting the second answer.
-3. **Re-run the Step 1 harness.** The exit test is "measurable gain over
-   the Step 1 baseline", and that means re-running `ARCHEX_EVAL_REPO` on the
-   same commits and recording the new Hit@3/MRR in `EVAL.md` — including
-   the case where it does *not* improve. Three causes are already named in
-   PLAN §11 "Measured results": the 5-symbol cap, symbol-substring matching
-   instead of path matching, and paths carrying most of the signal while
-   being barely read. Fix those three before building anything clever.
-4. **Delete `create_plan`.** 172 lines of keyword matching with hardcoded
-   advice (PLAN §17 item 3). It is scheduled for removal and every step
-   after this one is easier without it.
-5. **Optional, cheap, high value:** `archex status` — sync state, rule
-   coverage, ledger coverage. Mneme's Architecture Audit is the model:
-   which decisions are *Protected / Rules-only / Guidance*. Onboarding
-   surface, and the honest answer to "is this thing actually working".
+Then, in this order (full table and rationale in PLAN §11):
+
+| # | Slice | Why it is next |
+|---|---|---|
+| 3.8 | `proposed` = report-only | A drafted rule must not fail CI before anyone agreed to it |
+| 3.9 | **The forced loop** — `archex hook pre-edit` / `post-edit` + `setup --agent` wiring | Rules nobody delivers enforce nothing. This is the answer to "the agent forgets". Fail open, once per file per content hash |
+| 3.10 | `init --draft` — mined conventions + template library, each citing evidence | Removes the manual work. Blocked on 3.6: a draft on a lying graph is fiction |
+| 3.11 | `archex map` — tree, `--diff`, Mermaid projection | Seeing the architecture is what earns trust in a draft |
+| 3.12 | `archex review` — batched accept/reject, allowed-crossing records | The learning loop: a rejection is permanent |
+
+Retrieval (Step 4) and language breadth follow, not before: the forced
+loop is what makes this product work, and it is unblocked today.
 
 ### Two known gaps that Step 4 should close, not work around
 
@@ -171,6 +184,7 @@ Build order, smallest first:
 
 ```
 src/core/decision.rs   ledger format: parse, validate, chain heads, one writer
+src/core/parser.rs     tree-sitter extraction — three defects being fixed (PLAN §17.6)
 src/core/ledger.rs     sync (hash-driven, prunes, derives heads), the brief
 src/core/config.rs     config.toml + rules/*.toml parsers and validators
 src/core/db.rs         SQLite index, SCHEMA_VERSION 4

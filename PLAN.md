@@ -276,6 +276,33 @@ File-level resolved imports first. **The hard part is TypeScript** — `tsconfig
 | **4** | Retrieval surface: FTS5 word-split search, `search`/`traverse`/`read` with token budgets, stable ordering | Measurable gain over the Step 1 baseline | ⬜ not started |
 | **5** | Conditional: symbol edges, PageRank repo map | Only if Step 4 leaves retrieval as the proven bottleneck | ⬜ not started |
 
+### 3.5 → 4 — the adoption chain (approved 2026-10-13, after the fitness/LORB runs)
+
+Steps 0–3 produced a working gate and a working ledger, and a first run
+on a real repo showed **zero felt value**: `init` drafts one module per
+top-level directory, so on a flat repo there are no boundaries, no
+boundary rule is even expressible, and `check` prints "0 rule(s) loaded.
+No violations." Every user would have to author rules by hand before the
+tool did anything. That is the adoption cliff, and it is worse than a
+missing feature: it is setup cost with nothing at the top of it.
+
+Ordered by cost, not by appeal:
+
+| # | Ship | Exit test | State |
+|---|---|---|---|
+| **3.6** | **Three defects fixed.** Python/Rust imports are extracted with `module_id: 0` and destroyed by the foreign key (error discarded with `.ok()`); `.tsx` is parsed with the non-JSX grammar and loses symbols; `is_route_file` reads the absolute path and its `&&`/`||` precedence makes `/app/api/` match helpers | Each defect has a failing test that fails for its own reason | 🔴 red tests committed, fixing |
+| **3.7** | **`get_context` serves committed rules.** The rules table died in 2.5; this caller was left joining it and answering `rules: []` — which reads to an agent as "nothing applies here", and is what a pre-edit hook would inject before every edit | `get_context` returns the governing rule with its message, and nothing for a file it does not govern | ✅ done |
+| **3.8** | **`proposed` means report-only.** Today `is_active()` is `status != Retired`, so a draft rule fails CI before anyone agreed to it. Proposed = reported and counted, accepted = enforced | A proposed rule that matches is reported and `check` exits 0; accepted exits 1 | ⬜ |
+| **3.9** | **The forced loop.** PreToolUse injects the file's rules + decisions; PostToolUse runs the local verification the agent must pass before finishing (`archex check --file-path`, type check, tests). Hooks ship as plain CLIs (`archex hook pre-edit <file>` / `post-edit`) that `setup --agent` wires per agent — fail open, always, once per file per content hash | An agent that never calls a tool still receives the rules before editing | ⬜ |
+| **3.10** | **`init --draft`.** Candidate modules and rules from evidence, each citing where it came from. Two sources: **mined** — your own conventions (38/41 route files import zod) — and **templates**, because mining cannot teach what the code does not already do | `archex init --draft` on a monorepo produces reviewed proposals with cited evidence and zero TOML typed by hand | ⬜ |
+| **3.11** | **`archex map`** — the tree, `--diff`, and a Mermaid projection. The tree is the source; a diagram is a read-only projection of it, never hand-maintained | A human can see their architecture and what drifted since they accepted it | ⬜ |
+| **3.12** | **`archex review`** — batched accept/reject, writing allowed-crossing records. Agent never answers: a crossing is recorded `pending` and answered in the PR, because an agent has no authority over intent | A rejected proposal never returns | ⬜ |
+
+**Ordering is not negotiable.** 3.6 before 3.10 (a draft built on a lying
+graph is the fictional tree this plan warns about), and 3.9 before 3.10
+(rules nobody delivers to the agent enforce nothing — the `get_context`
+defect existed precisely because delivery was optional).
+
 ### Measured results
 
 **Step 1 — retrieval (project/fitness, 17 eligible commits).** The numbers
@@ -425,9 +452,10 @@ Explicitly **not** fixed: `create_plan` scoring and its hardcoded checklist — 
    rule path~~ — **closed in Step 2.5** for the DB. What remains is that
    only `boundary` rules have a file-based engine at all; `pattern` and
    `presence` are stored, listed, and explicitly reported as *not enforced
-   yet* rather than pretending. That engine work is not scheduled: the
-   boundary engine is the one that answers the question this tool exists
-   for, and it is the one that works.
+   yet* rather than pretending. The content-rule **engine** is not
+   scheduled before the adoption chain (§11, 3.10) because a drafted
+   content rule that cannot run is a rule that only looks enforced —
+   proposals must say so, and the engine follows.
 3. `create_plan` is 172 lines of dead weight scheduled for removal in
    Step 4.
 4. **Decisions are indexed but not searchable.** `sync` imports them and
@@ -438,6 +466,46 @@ Explicitly **not** fixed: `create_plan` scoring and its hardcoded checklist — 
    that). On the first run after a bump, `get_context` answers "not
    mapped — run `archex init`". Loud, but the honest fix is Step 4's
    hash-driven re-parse, not a surprise scan in the MCP server.
+6. **Three defects that made reported numbers wrong** (found by running
+   the binary against real repos, §11 3.6): Python/Rust imports
+   extracted with `module_id: 0` and destroyed by the imports foreign key
+   with the error discarded — so those repos have contributed zero edges
+   and zero coverage; `.tsx`/`.jsx` parsed with the non-JSX grammar, so
+   symbols next to JSX were dropped; `is_route_file` reading the absolute
+   path with `&&`/`||` precedence, so any repo under an `app/` directory
+   retyped ordinary files as routes.
+7. **Workspace packages resolve to their built entry point.** On a pnpm
+   monorepo, `@fitness/engine` resolves through node_modules to
+   `packages/engine/dist/index.js` — gitignored, never indexed — and 163
+   real edges left the graph while every cross-package rule reported "0
+   candidate edges". Counted and named since §11's fix; the resolution
+   itself is Step 4's tsconfig/paths work. Guessing
+   `dist/index.js → src/index.ts` is explicitly refused: it is the
+   low-confidence guess §9 rules out.
+
+### Designs rejected while planning 3.10 (kept so they are not re-proposed)
+
+- **`snapshot.toml`** — a mutable single file holding the accepted edge
+  counts is a second source of truth and a merge-conflict waiting to
+  happen, which is exactly what one-file-per-record exists to prevent.
+  Drift is diffed against the counts stored inside each rule and
+  crossing record instead.
+- **"This rule has not fired in 6 months"** — a boundary rule that never
+  fires is *working*. Flagging it trains people to delete good rules.
+  Only a rule matching **zero candidates** is drift, because that means a
+  broken glob or a dead module.
+- **"Module has had no inbound edges in 90 days"** — only detectable by
+  mining git history, which nothing does today. Dropped rather than
+  shipped as a guess.
+- **In-context questions to the agent** — an agent mid-session has no
+  authority over intent, and blocking one wastes tokens. The crossing is
+  recorded `pending` and answered in one batch in the PR. Only a *known
+  rejection* interrupts.
+- **Learning conventions from majority behaviour alone** — if 30 of 40
+  routes lack an ownership check there is no majority to learn from, and
+  a `requireAuth(` call proves authentication, not BOLA-style ownership.
+  Mining supplies what the code already does; a small template library
+  supplies what good practice requires.
 
 ## 18. Landscape (verified 2026-10-10)
 
