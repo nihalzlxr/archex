@@ -5,28 +5,7 @@ use tempfile::TempDir;
 
 mod common;
 
-use common::{call_mcp_tool, init, two_layer_fixture};
-
-/// Every symbol_type archex stored for this repo. The index is the only
-/// place the parser's typing decisions are observable, so this reads it.
-fn archex_db_rows(root: &Path) -> Vec<String> {
-    let conn = rusqlite::Connection::open(root.join(".archex/archex.db")).unwrap();
-    let mut stmt = conn
-        .prepare("SELECT symbol_type FROM symbols")
-        .expect("symbols table");
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("symbols rows");
-    rows.filter_map(|r| r.ok()).collect()
-}
-
-/// Every symbol name archex stored for this repo.
-fn archex_db_symbols(root: &Path) -> Vec<String> {
-    let conn = rusqlite::Connection::open(root.join(".archex/archex.db")).unwrap();
-    let mut stmt = conn.prepare("SELECT name FROM symbols").unwrap();
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
-    rows.filter_map(|r| r.ok()).collect()
-}
+use common::{init, two_layer_fixture};
 
 fn check(root: &Path) -> String {
     let out = Command::cargo_bin("archex")
