@@ -21,7 +21,7 @@ to hand-author a rule.
 | 2 — the gate | ✅ exit test passed on **LORB**: 0 false positives, 5 real violations found |
 | 2.5 — one truth for rules | ✅ advisory == gate == MCP, `rules` table deleted, import kinds shipped |
 | 3 — the ledger | ✅ exit test passed: an agent records a decision, a *new* server process serves it |
-| 3.5–4 — adoption chain | 🔴 **this is the work now** — three defects red, then `proposed`=report-only, then the forced loop, then drafting. See PLAN §11 |
+| 3.5–4 — adoption chain | 🔴 **this is the work now** — defects fixed, `get_context` fixed; next `proposed`=report-only, then the forced loop, then drafting. See PLAN §11 |
 | 4 — retrieval surface | ⬜ after the adoption chain. Retrieval is not what the forced loop needs |
 | 5 — conditional | ⬜ conditional |
 
@@ -32,12 +32,12 @@ expressible, and `check` prints "0 rule(s) loaded. No violations." A user
 who has to hand-author rules before anything happens will not adopt this.
 That is why 3.6–3.12 exist and why they precede retrieval.
 
-**241 tests. `cargo test` must stay green. `cargo build` must stay warning-free.**
+**246 tests. `cargo test` must stay green. `cargo build` must stay warning-free.**
 
 ## Commands
 
 ```bash
-cargo test                    # 241 tests
+cargo test                    # 246 tests
 cargo build                   # zero warnings is the bar, not a nice-to-have
 cargo run -- init             # draft .archex/config.toml if absent, then index
 cargo run -- check            # the gate: whole repo, exit 1 on a new violation
@@ -60,33 +60,32 @@ ARCHEX_EVAL_REPO=/tmp/fitness-eval ARCHEX_EVAL_N=20 \
 
 ## The next task, in full
 
-**Step 3.6 — finish the three defects.** Red tests are committed; the
-fixes are not. All three make a number archex prints wrong.
+**Step 3.8 — `proposed` means report-only.** Small, and nothing in 3.9–3.12
+works without it.
 
-1. **Python and Rust imports are destroyed.** Both extractors build
-   `Import { file_path: String::new(), module_id: 0, .. }`. The imports
-   table has `FOREIGN KEY(module_id)`, foreign keys are ON, module ids
-   start at 1 — so the insert fails for the whole file's batch, the error
-   is dropped with `.ok()` (`parser.rs` scan loop), and `init` still counts
-   them in "Imports extracted". **Fix:** normalize `file_path` and
-   `module_id` on every returned import in
-   `extract_symbols_and_imports`, so no collector can forget again.
-2. **`.tsx`/`.jsx` parse with the wrong grammar.** `LANGUAGE_TYPESCRIPT`
-   has zero JSX node types; `LANGUAGE_TSX` exists and is never used.
-   **Fix:** dispatch on the extension. Verify with the three-JSX-function
-   fixture in `tests/graph_holes.rs`.
-3. **`is_route_file` reads the absolute path**, with `&&` binding tighter
-   than `||` so `/app/api/` matches helpers next to route files.
-   **Fix:** hand it the repo-relative path and parenthesize the filename
-   clause. Unit tests are in `src/core/parser.rs`.
+Today `Rule::is_active()` is `status != Retired` (`src/core/config.rs`), so
+a rule with `status = "proposed"` is enforced exactly like an accepted one.
+That is right today — a proposal is meant to be reviewed — and wrong the
+moment drafting exists: `init --draft` writes candidate rules, and a
+candidate must never fail a build nobody agreed to yet.
+
+- **Proposed → reported and counted, never enforced.** `check` prints what
+  it would have found and exits 0. Accepted → exit 1, unchanged.
+- The advisory and the gate must agree on this too: `check --file-path`,
+  `check_drift` and CI go through the same engine, so one change covers all
+  three, and `tests/advisory_matches_gate.rs` is the guard.
+- `get_context` already sends `"enforced": false` for a proposal — keep the
+  two meanings consistent.
+
+**Exit test:** a proposed rule that matches is reported by `check` and the
+exit code is 0; the same rule with `status = "accepted"` exits 1.
 
 Then, in this order (full table and rationale in PLAN §11):
 
 | # | Slice | Why it is next |
 |---|---|---|
-| 3.8 | `proposed` = report-only | A drafted rule must not fail CI before anyone agreed to it |
 | 3.9 | **The forced loop** — `archex hook pre-edit` / `post-edit` + `setup --agent` wiring | Rules nobody delivers enforce nothing. This is the answer to "the agent forgets". Fail open, once per file per content hash |
-| 3.10 | `init --draft` — mined conventions + template library, each citing evidence | Removes the manual work. Blocked on 3.6: a draft on a lying graph is fiction |
+| 3.10 | `init --draft` — mined conventions + template library, each citing evidence | Removes the manual work. Needs 3.8, or a draft fails CI before it is read |
 | 3.11 | `archex map` — tree, `--diff`, Mermaid projection | Seeing the architecture is what earns trust in a draft |
 | 3.12 | `archex review` — batched accept/reject, allowed-crossing records | The learning loop: a rejection is permanent |
 
@@ -147,6 +146,15 @@ loop is what makes this product work, and it is unblocked today.
 
 ## Traps that cost real time
 
+- **A green test that cannot fail is worse than no test.** The first
+  `is_route_file` test put the repo under an `app/` directory and passed —
+  because the fixture never exercised the clause that fires. It now tests
+  the predicate directly, and the integration fixture lives where it can be
+  seen failing.
+- **`grep -c "test result: FAILED"` reports 0 when nothing compiles.** A
+  deleted helper turned the whole test target into a compile error, the
+  grep said zero failures, and it was nearly called green. Always read the
+  tail of `cargo test`, not a pattern that can only match a running suite.
 - **JSON-RPC here is line-delimited.** A pretty-printed `arguments` payload
   in a test is two broken messages, not a formatted one. All test arguments
   must be single-line.
@@ -160,6 +168,10 @@ loop is what makes this product work, and it is unblocked today.
   not `import_type`. The first implementation looked for `import_type`,
   matched nothing, and read every type-only import as a runtime edge —
   exactly the false positive the column exists to remove. Pinned by tests.
+- **tree-sitter-rust names the `use` field `argument`**, not `tree`. Asking
+  for `tree` returns `None` silently, and every `use` statement disappears
+  without a word. Check the grammar's field names against a real parse tree
+  before trusting a collector.
 - **`archex init` prompts when an index exists.** In scripts, pipe `y`.
 
 ## Environment notes
@@ -184,14 +196,14 @@ loop is what makes this product work, and it is unblocked today.
 
 ```
 src/core/decision.rs   ledger format: parse, validate, chain heads, one writer
-src/core/parser.rs     tree-sitter extraction — three defects being fixed (PLAN §17.6)
+src/core/parser.rs     tree-sitter extraction: symbols, imports, route detection
 src/core/ledger.rs     sync (hash-driven, prunes, derives heads), the brief
 src/core/config.rs     config.toml + rules/*.toml parsers and validators
 src/core/db.rs         SQLite index, SCHEMA_VERSION 4
 src/core/resolve.rs    import resolution (the gate's foundation)
 src/core/boundary.rs   the boundary engine
 src/core/baseline.rs   baseline.toml
-src/core/parser.rs     tree-sitter extraction: symbols, imports, line numbers
+src/core/hash.rs       content hashing for the derived index (FNV-1a, a cache key)
 src/core/eval.rs       Step 1 harness (#[ignore]d)
 src/cli/decide.rs      the decision ledger CLI
 src/cli/rule.rs        the rule CLI

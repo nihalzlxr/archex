@@ -290,9 +290,9 @@ Ordered by cost, not by appeal:
 
 | # | Ship | Exit test | State |
 |---|---|---|---|
-| **3.6** | **Three defects fixed.** Python/Rust imports are extracted with `module_id: 0` and destroyed by the foreign key (error discarded with `.ok()`); `.tsx` is parsed with the non-JSX grammar and loses symbols; `is_route_file` reads the absolute path and its `&&`/`||` precedence makes `/app/api/` match helpers | Each defect has a failing test that fails for its own reason | 🔴 red tests committed, fixing |
+| **3.6** | **Three defects fixed.** Python/Rust imports are extracted with `module_id: 0` and destroyed by the foreign key (error discarded with `.ok()`); `.tsx` is parsed with the non-JSX grammar and loses symbols; `is_route_file` reads the absolute path and its `&&`/`||` precedence makes `/app/api/` match helpers | Each defect has a failing test that fails for its own reason | ✅ done — 246 tests. A **fourth** bug surfaced during the fix: Rust `use` declarations were never extracted at all (the grammar field is `argument`, not `tree`), so the FK bug was hiding behind it |
 | **3.7** | **`get_context` serves committed rules.** The rules table died in 2.5; this caller was left joining it and answering `rules: []` — which reads to an agent as "nothing applies here", and is what a pre-edit hook would inject before every edit | `get_context` returns the governing rule with its message, and nothing for a file it does not govern | ✅ done |
-| **3.8** | **`proposed` means report-only.** Today `is_active()` is `status != Retired`, so a draft rule fails CI before anyone agreed to it. Proposed = reported and counted, accepted = enforced | A proposed rule that matches is reported and `check` exits 0; accepted exits 1 | ⬜ |
+| **3.8** | **`proposed` means report-only.** Today `is_active()` is `status != Retired`, so a draft rule fails CI before anyone agreed to it. Proposed = reported and counted, accepted = enforced | A proposed rule that matches is reported and `check` exits 0; accepted exits 1 | 🔴 **next** |
 | **3.9** | **The forced loop.** PreToolUse injects the file's rules + decisions; PostToolUse runs the local verification the agent must pass before finishing (`archex check --file-path`, type check, tests). Hooks ship as plain CLIs (`archex hook pre-edit <file>` / `post-edit`) that `setup --agent` wires per agent — fail open, always, once per file per content hash | An agent that never calls a tool still receives the rules before editing | ⬜ |
 | **3.10** | **`init --draft`.** Candidate modules and rules from evidence, each citing where it came from. Two sources: **mined** — your own conventions (38/41 route files import zod) — and **templates**, because mining cannot teach what the code does not already do | `archex init --draft` on a monorepo produces reviewed proposals with cited evidence and zero TOML typed by hand | ⬜ |
 | **3.11** | **`archex map`** — the tree, `--diff`, and a Mermaid projection. The tree is the source; a diagram is a read-only projection of it, never hand-maintained | A human can see their architecture and what drifted since they accepted it | ⬜ |
@@ -466,14 +466,28 @@ Explicitly **not** fixed: `create_plan` scoring and its hardcoded checklist — 
    that). On the first run after a bump, `get_context` answers "not
    mapped — run `archex init`". Loud, but the honest fix is Step 4's
    hash-driven re-parse, not a surprise scan in the MCP server.
-6. **Three defects that made reported numbers wrong** (found by running
-   the binary against real repos, §11 3.6): Python/Rust imports
-   extracted with `module_id: 0` and destroyed by the imports foreign key
-   with the error discarded — so those repos have contributed zero edges
-   and zero coverage; `.tsx`/`.jsx` parsed with the non-JSX grammar, so
-   symbols next to JSX were dropped; `is_route_file` reading the absolute
-   path with `&&`/`||` precedence, so any repo under an `app/` directory
-   retyped ordinary files as routes.
+6. ~~Three defects that made reported numbers wrong~~ — **closed in Step
+   3.6.** Found by running the binary against real repos, not by reading
+   this plan:
+   - Python and Rust imports extracted with `module_id: 0` and destroyed
+     by the imports foreign key, the error discarded with `.ok()` — those
+     repos had contributed zero edges and zero coverage while reporting
+     work done.
+   - **Rust `use` declarations were never extracted at all.** The grammar
+     field is `argument`, not `tree`, so the lookup returned `None` for
+     every one. The FK bug was hiding a bug underneath it, and a Rust repo
+     could not have been reporting correct numbers because it had none.
+   - `.tsx`/`.jsx` parsed with the non-JSX grammar, which has zero JSX
+     node types; symbols adjacent to JSX were dropped.
+   - `is_route_file` reading the absolute path with `&&`/`||` precedence,
+     so any repo under an `app/` directory retyped ordinary files as
+     routes. The pages router (every file is a route) and the app router
+     (only `page.*`/`route.*`) are now distinguished.
+   - Fixing the last one exposed a classification error of mine from the
+     graph-holes work: `specifier_home` filed Rust's `crate::db::pool`
+     under "external package" because it reads as a bare specifier. The
+     parser's `kind` now wins when it is decisive; shape is read only
+     where the syntax is genuinely ambiguous (`type_only`, `dynamic`).
 7. **Workspace packages resolve to their built entry point.** On a pnpm
    monorepo, `@fitness/engine` resolves through node_modules to
    `packages/engine/dist/index.js` — gitignored, never indexed — and 163
