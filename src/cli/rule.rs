@@ -630,7 +630,9 @@ fn migrate(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("the migrated rule is not valid, nothing was written: {}", e))?;
 
         let path = rule_path(root, &migrated.id);
-        std::fs::write(&path, body)?;
+        std::fs::create_dir_all(rules_dir(root))?;
+        std::fs::write(&path, body)
+            .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
         println!(
             "  wrote {}  <- `{}` on module `{}`",
             path.display(),
@@ -642,8 +644,15 @@ fn migrate(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         written += 1;
     }
 
-    if written == 0 && skipped == 0 {
-        println!("nothing to migrate.");
+    if written == 0 {
+        if skipped == 0 {
+            println!("nothing to migrate.");
+        } else {
+            println!(
+                "nothing new to migrate — {} rule file(s) already exist.",
+                skipped
+            );
+        }
     } else {
         println!(
             "wrote {} rule file(s){}. Commit them — the gate reads what is committed.",
