@@ -144,35 +144,55 @@ Rules live in FILES, never in the database: plain text in git is the source
 of truth (§2.5), and a rule that exists only in a local index enforces
 nothing on anyone else's machine.
 
-**Deferred, and this section is not yet complete:** import classification
-(§19.4). A boundary rule must be able to say whether `import type` edges
-count, because type-only imports cannot create runtime coupling but are
-still compile-time coupling, and the choice is the human's. Measured on
-LORB, type-only edges are 713 of 10,638 — 6.7% of the graph — so the
-default matters more than usual.
+**Resolved in Step 2.5:** import classification (§19.4) shipped with the
+`imports.kind` column and `include_type_only`, default-skip. The schema
+above is now honest about what the engine can do.
 
 ### decisions/<ULID>-<slug>.md — markdown + frontmatter
 
+**Frontmatter is TOML, not YAML.** The body is markdown; the `---` header is
+parsed as TOML, which is what `config.toml` and every rule file already use:
+one parser, one `deny_unknown_fields` discipline, no second dependency. The
+YAML sketch below reads the same with `=` and quoted arrays.
+
 ```markdown
 ---
-schema_version: 1
-id: 01J8K2A7B3C4D5E6F7G8H9J0K     # ULID — sorts by time, conflict-free
-title: Use Drizzle as the ORM
-status: proposed                     # proposed | accepted | superseded
-supersedes: []                       # ULIDs this replaces
-task: add-billing-webhooks           # provenance
-scope: [db, services]
-author: human                        # human | agent
-recorded_at: 2026-10-08T14:22:00Z
+schema_version = 1
+id = 01J8K2A7B3C4D5E6F7G8H9J0KM     # ULID — sorts by time, conflict-free
+title = "Use Drizzle as the ORM"
+status = "proposed"                  # proposed | accepted
+supersedes = []                      # ULIDs this replaces
+task = "add-billing-webhooks"        # provenance
+scope = ["db", "services"]
+author = "human"                     # human | agent
+recorded_at = "2026-10-08T14:22:00Z"
 ---
 ## Context / ## Decision / ## Alternatives rejected
 ```
 
-Agent writes `status: proposed, author: agent` → merging the PR accepts it. **Superseded is derived, never written:** sync resolves chains and serves only the head. Files are never modified by archex.
+Agent writes `status: proposed, author: agent` → merging the PR accepts it. **Superseded is derived, never written:** sync resolves the `supersedes` chain and serves only the heads, so `status = "superseded"` is REJECTED at validation for the same reason `reachable = true` is — a record cannot be trusted to vouch for its own replacement. Cycles and dangling `supersedes` entries are errors, not dropped links.
 
-### tasks/<id>.md
+`scope` holds module or layer names, never paths: scope selects which files
+get the decision injected, and an entry that can never match is a decision
+nobody is ever told about. `sync` names every scope entry that matches
+nothing.
 
-Goal, plan, decisions made, where we stopped, next steps. Frontmatter: `id, title, status (active|blocked|done|abandoned), owner, branch, created, updated, decisions: [ULIDs]`. Lives on the feature branch, merges with the PR. **Done is derived:** a task file present on main = done/historical. Friday you stop, Monday any agent picks up from the file. Nothing is lost to compaction.
+**Still deferred:** `tasks/<id>.md` (the task ledger — parity with
+Archcore's plans, not a wedge; it rides with the feature branch and adds
+nothing to the exit test).
+
+### decisions, as built (Step 3)
+
+| Piece | Where |
+|---|---|
+| format + validator | `src/core/decision.rs` — `parse_named`, `validate`, `chain_heads` |
+| one writer | `decision::write_new` — renders, validates, refuses to overwrite, then writes. CLI and MCP share it |
+| index | `src/core/ledger.rs` — `sync` is hash-driven, prunes deletions, derives heads |
+| injection | `get_context` carries ≤10 briefs per file, plus the count of what was left out |
+| agent write path | `record_decision` — no `status` and no `author` parameter exist, so an agent cannot accept its own decision |
+
+Files are never modified by archex. `sync` proves it: a test asserts the
+committed bytes and the mtime are untouched after a run.
 
 ### baseline.toml — committed, because CI is stateless
 
@@ -237,9 +257,9 @@ File-level resolved imports first. **The hard part is TypeScript** — `tsconfig
 
 | Tool | Today | Steps 0–3 | Step 4 |
 |---|---|---|---|
-| `get_context` | keep | keep (serves rules + decisions slice) | keep |
-| `check_drift` | keep | keep (advisory pre-edit feedback) | keep |
-| `record_decision` | — | **new (Step 3)** | keep |
+| `get_context` | keep | keep (serves rules + decisions slice — **shipped**) | keep |
+| `check_drift` | keep | keep (advisory pre-edit feedback, same engine as the gate — **shipped**) | keep |
+| `record_decision` | — | **new (Step 3) — shipped** | keep |
 | `get_module`, `find_similar` | keep | untouched | folded in |
 | `create_plan` | broken | untouched (dying) | **removed** |
 | `search` / `traverse` / `read` | — | — | **new (Step 4)** |
@@ -251,8 +271,8 @@ File-level resolved imports first. **The hard part is TypeScript** — `tsconfig
 | **0** | Truthful core: idempotent init, symbol dedup (`clear_file_symbols` wired), shared case-correct regex helper, `exported` + signature extraction fixes, WAL + one shared connection, path normalization, dead code deleted, generic module seeding, **fixture tests + full suite** | `init` twice clean; suite green | ✅ done — 176 tests, zero warnings |
 | **1** | **Eval harness**: ~20 real LORB commits, ground truth = files each commit touched; Hit@3, MRR, function accuracy; baselines = plain grep + current archex | Numbers recorded | ✅ done — see below. Run on `project/fitness`; LORB reserved for Step 2 (below) |
 | **2** | **The Gate**: file-level import resolution, rules as data, `archex check` + CI job, baseline mode | ≥1 real violation caught on LORB; **zero false positives on a clean tree** | ✅ done — both halves, on LORB |
-| **2.5** | **One source of truth for rules.** Gate, `check --file-path` and MCP `check_drift` load `.archex/rules/*.toml` through **one loader and one engine**. `rule add` writes a validated file through the real validator (canonical serialization; flags grow `--from --to --allow-to --severity`, or boundary rules stay CLI-unreachable); `rule remove` **retires** by default (`status = "retired"`), `--purge` deletes; `archex rule migrate` converts DB rules — refusing any whose module has no layer in `config.toml` — then the `rules` table dies **and the `imports.kind` column arrives in the same SCHEMA_VERSION 2→3 bump** (5 kinds: relative | aliased | package | type-only | dynamic; the boundary engine honors `include_type_only`). Legacy DB rules warn once on startup, then migrate | **The per-file advisory result for file X equals the gate's findings filtered to X** — measured on a fixture where X contains at least one violation, *including a type-only cross-boundary import so default-skip is exercised on both paths*, so the assertion cannot pass vacuously. Advisory and gate must never disagree, or agents learn to distrust the advisory | ⬜ next — full approach in `RESUME.md` |
-| **3** | **The Ledger**: file formats + validator, `archex sync`, brief injection, `decide` CLI, `record_decision` MCP tool | An agent logs a decision mid-session; the next session starts knowing it | ⬜ not started |
+| **2.5** | **One source of truth for rules.** Gate, `check --file-path` and MCP `check_drift` load `.archex/rules/*.toml` through **one loader and one engine**. `rule add` writes a validated file through the real validator (canonical serialization; flags grow `--from --to --allow-to --severity`, or boundary rules stay CLI-unreachable); `rule remove` **retires** by default (`status = "retired"`), `--purge` deletes; `archex rule migrate` converts DB rules — refusing any whose module has no layer in `config.toml` — then the `rules` table dies **and the `imports.kind` column arrives in the same SCHEMA_VERSION 2→3 bump** (5 kinds: relative | aliased | package | type-only | dynamic; the boundary engine honors `include_type_only`). Legacy DB rules warn once on startup, then migrate | **The per-file advisory result for file X equals the gate's findings filtered to X** — measured on a fixture where X contains at least one violation, *including a type-only cross-boundary import so default-skip is exercised on both paths*, so the assertion cannot pass vacuously. Advisory and gate must never disagree, or agents learn to distrust the advisory | ✅ done — `tests/advisory_matches_gate.rs`, `tests/mcp_agrees_with_gate.rs`, `tests/import_kinds.rs` |
+| **3** | **The Ledger**: file formats + validator, `archex sync`, brief injection, `decide` CLI, `record_decision` MCP tool | An agent logs a decision mid-session; the next session starts knowing it | ✅ done — `tests/record_decision.rs` drives the real stdio server: record, kill the process, ask a *new* one for context. Measured on LORB too. 235 tests |
 | **4** | Retrieval surface: FTS5 word-split search, `search`/`traverse`/`read` with token budgets, stable ordering | Measurable gain over the Step 1 baseline | ⬜ not started |
 | **5** | Conditional: symbol edges, PageRank repo map | Only if Step 4 leaves retrieval as the proven bottleneck | ⬜ not started |
 
@@ -397,15 +417,27 @@ Explicitly **not** fixed: `create_plan` scoring and its hardcoded checklist — 
 
 ## 17. Open items
 
-1. **Rules still have two sources of truth** — now **Step 2.5** in the build
-   order (§11), full approved approach in `RESUME.md`. Note the trap inside
-   the task: today's `rule add` flags (`--module --rule-type --description
-   --pattern`) cannot express a boundary rule at all, so the CLI must grow
-   `--from --to --allow-to --severity` in the same unit, or the headline
-   feature of Step 2 stays CLI-unreachable and the migration is half-done.
-2. `check --file-path` and the pattern/presence engines still use the DB rule
-   path; they move with Step 2.5.
-3. `create_plan` is 172 lines of dead weight scheduled for removal in Step 4.
+1. ~~Rules still have two sources of truth~~ — **closed in Step 2.5**. One
+   loader (`config::load_rules`), one engine (`boundary::check`) behind the
+   gate, `check --file-path` and MCP `check_drift`. The `rules` table is
+   gone (SCHEMA_VERSION 3), `archex rule migrate` bridges an old index.
+2. ~~`check --file-path` and the pattern/presence engines still use the DB
+   rule path~~ — **closed in Step 2.5** for the DB. What remains is that
+   only `boundary` rules have a file-based engine at all; `pattern` and
+   `presence` are stored, listed, and explicitly reported as *not enforced
+   yet* rather than pretending. That engine work is not scheduled: the
+   boundary engine is the one that answers the question this tool exists
+   for, and it is the one that works.
+3. `create_plan` is 172 lines of dead weight scheduled for removal in
+   Step 4.
+4. **Decisions are indexed but not searchable.** `sync` imports them and
+   `get_context` injects by scope; keyword retrieval (`archex decide
+   search`, FTS5) is Step 4 work alongside the symbol search surface.
+5. **A schema bump empties the source index.** 3 → 4 drops the source
+   tables, and `sync` deliberately does not re-parse code (`init` owns
+   that). On the first run after a bump, `get_context` answers "not
+   mapped — run `archex init`". Loud, but the honest fix is Step 4's
+   hash-driven re-parse, not a surprise scan in the MCP server.
 
 ## 18. Landscape (verified 2026-10-10)
 
@@ -474,6 +506,7 @@ Steals with sources. Each is small now, expensive after Step 3+.
 
    **Sequencing decided (2026-10-10): the `kind` column ships in Step 2.5,
    in the same SCHEMA_VERSION 2→3 bump that drops the `rules` table.**
+   **(Delivered 2026-10-11: both, in that bump.)**
    (a) §5 already carries `include_type_only` — a field whose default-skip
    behavior cannot be honored without kind data is the same
    accepted-but-does-nothing failure `reachable = true` was rejected for;

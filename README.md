@@ -23,12 +23,14 @@ A CLAUDE.md file can't fix this: it's advice the model can ignore under pressure
 | **Architecture memory** | Layers, boundary rules, and past decisions are injected into every agent session automatically — no re-explaining, no prompt rituals |
 | **The gate** | Rules enforced in CI with file, line, and a plain-English fix. Breaking a boundary fails the PR in seconds, not in review |
 | **Baseline mode** | Existing violations are recorded once — only *new* violations block. Old debt burns down deliberately |
-| **Task ledger** | Stop Friday, resume Monday in any agent — goal, plan, decisions, and where you stopped travel with the branch |
-| **Agent write-back** | Agents record what they learn (`record_decision`); merging the PR turns it into team memory |
-| **Blast radius** | "If I change this, what breaks?" answered before the refactor, not discovered in review |
-| **Symbol search** | Search `user`, find `getUserById` — word-split full-text over every indexed symbol |
-| **Git is the sync layer** | Teammates get new rules and decisions with `git pull`. Zero per-machine setup |
-| **Signatures first** | Context is served as compact signatures with token budgets — agents read maps, not whole files |
+| **Decision ledger** | One markdown file per decision, in git, reviewed like code. An agent records why it did something; the next session starts knowing |
+| **Agent write-back** | Agents record what they learn (`record_decision`) as *proposals*; a human accepts them in the PR |
+| **Git is the sync layer** | Teammates get new decisions with `git pull`. Zero per-machine setup |
+| **Uncovered is not clean** | Files and imports archex cannot classify are counted and reported. A gap never reads as a pass |
+| **Task ledger** | *Planned (Step 4)* — stop Friday, resume Monday in any agent |
+| **Blast radius** | *Planned (Step 4)* — "if I change this, what breaks?" answered before the refactor |
+| **Symbol search** | *Planned (Step 4)* — search `user`, find `getUserById`, word-split over every indexed symbol |
+| **Signatures first** | *Planned (Step 4)* — context served as compact signatures with token budgets |
 
 ---
 
@@ -39,18 +41,20 @@ A CLAUDE.md file can't fix this: it's advice the model can ignore under pressure
 cargo install --path .
 
 # In your repo:
-archex init       # scan the codebase, build the index
+archex init       # scan the codebase, draft config.toml if absent, build the index
 archex setup      # auto-detect your agent, write its MCP config
-archex sync       # import rules/decisions from git into the local index
+archex decide add --title "..." --decision "..." --scope <module> --alternative "..."
+archex check      # the gate: whole repo, exit 1 on a new violation
 ```
 
-Add the gate to CI (GitHub Actions example):
+Add the gate to CI (`archex setup --agent ci` writes the job):
 
 ```yaml
 - name: archex gate
   run: |
     curl -sSL https://releases.archex.dev/install.sh | sh   # or: cargo install archex
-    archex check --ci
+    archex init          # CI is stateless: build the index from the PR's code
+    archex check --strict
 ```
 
 The first time a violation exists that you accept as existing debt: `archex check --update-baseline` records it, and CI only fails on new violations from then on.
@@ -61,8 +65,8 @@ The first time a violation exists that you accept as existing debt: `archex chec
 
 | Piece | Role |
 |---|---|
-| **CLI** | `init`, `sync`, `serve`, `check`, `decide`, `status` |
-| **MCP server** (stdio) | What agents talk to. A generated brief — layers, boundary rules, active decisions — is delivered to every session automatically. Agents pull detailed slices through tools and push learnings via `record_decision` |
+| **CLI** | `init`, `check`, `sync`, `decide`, `rule`, `serve`, `setup` |
+| **MCP server** (stdio) | What agents talk to. Agents pull slices through tools and push learnings via `record_decision`; the server syncs the ledger at startup, so a pulled decision reaches the next session with no command in between |
 | **CI job** | The real gate. Builds an ephemeral index from the PR's code, reads committed rules and baseline, returns an exit code. Stores nothing between runs |
 | **Local index** | SQLite at `.archex/archex.db` — a derived cache, rebuilt from code + committed files. Never committed |
 
@@ -72,12 +76,12 @@ The first time a violation exists that you accept as existing debt: `archex chec
 .archex/
   config.toml                  # modules + layers (reviewed in PRs like code)
   rules/<id>.toml              # one rule per file
-  decisions/<ULID>-<slug>.md    # one decision per file, append-only
-  tasks/<id>.md                # task ledger, travels with the feature branch
+  decisions/<ULID>-<slug>.md    # one decision per file
   baseline.toml                # accepted existing violations
+  tasks/<id>.md                # planned (Step 4)
 ```
 
-Everything is plain text: merge-conflict-free by design (one file per record, ULID names), reviewed in pull requests, and readable by humans and agents alike.
+Everything is plain text: merge-conflict-free by design (one file per record, ULID names), reviewed in pull requests, and readable by humans and agents alike. archex never modifies a committed file — `sync` imports records into a local cache and leaves the originals byte for byte identical.
 
 ---
 
@@ -86,22 +90,28 @@ Everything is plain text: merge-conflict-free by design (one file per record, UL
 | Tool | Description |
 |---|---|
 | `get_context(file_path)` | Module, layer, rules, and relevant decisions for a file — before editing |
-| `search(query)` | Ranked symbol search (word-split, camelCase-aware) |
-| `traverse(symbols, direction, hops)` | Impact subgraph — who imports, who calls, what breaks |
-| `read(symbols)` | Signatures by default, full code on demand |
-| `record_decision(...)` | Agent write path — proposals accepted when the PR merges |
+| `record_decision(...)` | Agent write path — records a proposal with the alternatives it rejected; a human accepts it in the PR |
 | `check_drift(file_path)` | Fast advisory violation check during editing (CI is the guarantee) |
+| `get_module`, `find_similar` | Module info; similar-symbol lookup |
+| `create_plan` | **Removed in Step 4** — it was keyword matching with hardcoded advice |
 
 ## CLI
 
 | Command | Description |
 |---|---|
-| `archex init` | Scan the codebase and build the local index |
-| `archex sync` | Import changed rules/decisions/tasks from git; re-parse changed files |
+| `archex init` | Scan the codebase, draft `.archex/config.toml` if absent, build the local index |
+| `archex check` | The gate (`--file-path` for one file, `--strict`, `--update-baseline`) |
+| `archex sync` | Import committed decision records into the local index. Hash-driven, idempotent, never writes to a committed file |
+| `archex decide add\|list\|show` | Write and read decisions in `.archex/decisions/` |
+| `archex rule list\|add\|remove\|migrate` | The same, for `.archex/rules/` |
 | `archex serve` | Start the MCP server (stdio) |
-| `archex check` | Run the gate locally (`--update-baseline`, `--ci` for CI mode) |
-| `archex decide` | Browse and manage the decision log |
-| `archex status` | Sync state, active rules, violations vs baseline |
+| `archex setup --agent <name>` | Write the MCP config for opencode / Cursor / Claude |
+| `archex status` | **Planned (Step 4)** — sync state, rule coverage, ledger coverage |
+
+`sync` imports the **ledger** only. Source files are parsed by `archex
+init`; the hash-driven re-parse of changed source files is Step 4 work.
+After a schema bump the index is rebuilt empty until `init` runs, and
+`get_context` says so rather than reporting a clean run.
 
 ---
 
