@@ -1157,4 +1157,52 @@ mod tests {
             );
         }
     }
+
+    /// Defect 3: `is_route_file` was handed the ABSOLUTE path, so a repo
+    /// living under any `app/` directory had ordinary files retyped as
+    /// routes. The `&&`/`||` precedence made it worse: `/app/api/` matched
+    /// on its own, ignoring the filename clause, so every helper under an
+    /// api directory became a route.
+    #[test]
+    fn a_path_above_the_repo_root_cannot_decide_what_a_file_is() {
+        // A repo that happens to live under /app/ — the shape that produced
+        // bogus route symbols. Nothing in `src/lib` is a route file.
+        assert!(
+            !Parser::is_route_file(std::path::Path::new(
+                "/home/dev/app/lorb/src/lib/page.ts"
+            )),
+            "a file outside src/app cannot become a route because of where \
+             the repository lives"
+        );
+    }
+
+    #[test]
+    fn only_page_and_route_files_are_routes() {
+        for path in [
+            "src/app/api/route.ts",
+            "src/app/api/route.tsx",
+            "src/app/dashboard/page.tsx",
+            "src/pages/api/users.ts",
+        ] {
+            assert!(
+                Parser::is_route_file(std::path::Path::new(path)),
+                "{} is a route file",
+                path
+            );
+        }
+
+        // The precedence bug: `/app/api/` matched on its own, so a plain
+        // helper next to the routes was typed as one.
+        for path in [
+            "src/app/api/handlers.ts",
+            "src/app/api/schemas.ts",
+            "src/app/api/helpers/thing.ts",
+        ] {
+            assert!(
+                !Parser::is_route_file(std::path::Path::new(path)),
+                "{} is a helper, not a route file",
+                path
+            );
+        }
+    }
 }

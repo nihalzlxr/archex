@@ -5,7 +5,20 @@ use tempfile::TempDir;
 
 mod common;
 
-use common::{init, two_layer_fixture};
+use common::{call_mcp_tool, init, two_layer_fixture};
+
+/// Every symbol_type archex stored for this repo. The index is the only
+/// place the parser's typing decisions are observable, so this reads it.
+fn archex_db_rows(root: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join(".archex/archex.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT symbol_type FROM symbols")
+        .expect("symbols table");
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("symbols rows");
+    rows.filter_map(|r| r.ok()).collect()
+}
 
 fn check(root: &Path) -> String {
     let out = Command::cargo_bin("archex")
@@ -232,4 +245,103 @@ fn a_scoped_specifier_that_did_not_resolve_is_reported_as_ambiguous() {
         "while the unambiguous gap stays in its own count, got:\n{}",
         out
     );
+}
+
+/// Defect 1: every Python and Rust import was extracted with
+/// `module_id: 0` and an empty `file_path`. The imports table has a foreign
+/// key on module_id, so the whole per-file batch failed — and the error was
+/// discarded with `.ok()`, while `init` still counted them as extracted.
+///
+/// `import os` in a .py file is the smallest possible witness: if the row
+/// survives, the gate counts it as an external package.
+#[test]
+fn a_python_import_survives_the_index() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+
+    fs::write(
+        root.join("src/db/helpers.py"),
+        "import os\n\n\ndef read(path):\n    return os.path.exists(path)\n",
+    )
+    .unwrap();
+
+    init(root);
+    let out = check(root);
+
+    assert!(
+        out.contains("1 external package import(s)"),
+        "a Python import must reach the index, got:\n{}",
+        out
+    );
+}
+
+/// The same defect for Rust, and the same failure mode: the import is
+/// counted by `init` and never stored.
+#[test]
+fn a_rust_import_survives_the_index() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+
+    fs::write(
+        root.join("src/db/client.rs"),
+        "use serde::Serialize;\n\npub fn connect() -> i32 { 0 }\n",
+    )
+    .unwrap();
+
+    init(root);
+    let out = check(root);
+
+    assert!(
+        out.contains("1 unresolved first-party import(s)"),
+        "a Rust use statement must reach the index as an unclassified edge, got:\n{}",
+        out
+    );
+}
+
+/// Defect 2: `.tsx` was parsed with the plain TypeScript grammar, which has
+/// no JSX node types at all. Tree-sitter error recovery then produced a
+/// malformed tree and symbols adjacent to JSX were silently lost — the file
+/// that mattered most in a React codebase was the file we understood least.
+#[test]
+fn symbols_next_to_jsx_are_not_lost() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    two_layer_fixture(root);
+
+    fs::write(
+        root.join("src/components/Panel.tsx"),
+        r#"export function First() {
+  return <div className="a">one</div>;
+}
+
+export function Second() {
+  const rows = [1, 2, 3];
+  return rows.map((row) => <span key={row}>{row}</span>);
+}
+
+export function Third() {
+  return <ul><li>three</li></ul>;
+}
+"#,
+    )
+    .unwrap();
+
+    init(root);
+
+    let found = call_mcp_tool(
+        root,
+        "find_similar",
+        &format!(r#"{{"description":"{}"}}"#, "Third"),
+    );
+    for symbol in ["First", "Second", "Third"] {
+        assert!(
+            found.contains(symbol),
+            "a function declared in a .tsx file must be indexed, {} was lost. \
+             Full response:\n{}",
+            symbol,
+            found
+        );
+    }
 }
