@@ -1,4 +1,4 @@
-use crate::core::decision::{self, Author, Decision, DecisionStatus};
+use crate::core::decision::{self, Author, Decision, DecisionStatus, NewDecision};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +37,8 @@ pub enum DecideCommands {
         /// agents propose and humans accept.
         #[arg(long)]
         status: Option<String>,
-        /// ULID of the decision this replaces.
+        /// ULID of the decision this replaces. Superseded is derived from
+        /// this chain; it is never written into the old record.
         #[arg(long)]
         supersedes: Option<String>,
     },
@@ -50,7 +51,7 @@ pub enum DecideCommands {
         #[arg(long)]
         include_superseded: bool,
     },
-    /// Print one decision in full, by ULID or by unique slug
+    /// Print one decision in full, by ULID or by slug
     Show {
         id: String,
     },
@@ -123,11 +124,7 @@ fn add(root: &Path, args: &AddArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(value) if value == "proposed" => DecisionStatus::Proposed,
         Some(value) if value == "accepted" => DecisionStatus::Accepted,
         Some(other) => {
-            return Err(format!(
-                "unknown status '{}'. Use: proposed, accepted",
-                other
-            )
-            .into())
+            return Err(format!("unknown status '{}'. Use: proposed, accepted", other).into())
         }
         None if author == Author::Agent => DecisionStatus::Proposed,
         None => DecisionStatus::Accepted,
@@ -141,43 +138,31 @@ fn add(root: &Path, args: &AddArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if let Some(superseded) = &args.supersedes {
-        if !decision::is_ulid(superseded) {
-            return Err(format!("`{}` is not a ULID", superseded).into());
+    let supersedes = match &args.supersedes {
+        Some(id) if !decision::is_ulid(id) => {
+            return Err(format!("`{}` is not a ULID", id).into())
         }
-    }
+        Some(id) => vec![id.clone()],
+        None => Vec::new(),
+    };
 
-    let id = decision::new_ulid();
-    let slug = slugify(&args.title);
-    let path = decisions_dir(root).join(format!("{}-{}.md", id, slug));
-
-    if path.exists() {
-        return Err(format!("refusing to overwrite {}", path.display()).into());
-    }
-
-    let body = render(
-        &id,
-        &slug,
-        args.status.as_deref().map(|_| status),
+    let new = NewDecision {
+        id: decision::new_ulid(),
+        title: args.title.clone(),
+        decision: args.decision.clone(),
+        context: args.context.clone(),
+        alternatives: args.alternative.clone(),
+        scope: args.scope.clone(),
+        task: args.task.clone(),
         status,
         author,
-        args,
-    );
+        supersedes,
+        recorded_at: decision::now_rfc3339(),
+    };
 
-    // The record goes through the parser the ledger reads before it
-    // touches the disk: a decision that only fails at sync was written by a
-    // broken CLI.
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    Decision::parse_named(&name, &body)
-        .map_err(|e| format!("the decision as written is not valid: {}\nnothing was written", e))?;
+    let path = decision::write_new(root, &new)?;
 
-    std::fs::create_dir_all(decisions_dir(root))?;
-    std::fs::write(&path, &body)?;
-
-    println!("[OK] Decision written: {}", path.display());
+    println!("[OK] Decision written: {}/{}", root.display(), path);
     match status {
         DecisionStatus::Proposed => {
             println!("  Proposed. It becomes current when a human merges it.");
@@ -191,112 +176,6 @@ fn add(root: &Path, args: &AddArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
-}
-
-/// Canonical on purpose: fixed field order, defaults omitted, so the diff of
-/// a decision is the decision.
-fn render(
-    id: &str,
-    slug: &str,
-    _requested: Option<DecisionStatus>,
-    status: DecisionStatus,
-    author: Author,
-    args: &AddArgs,
-) -> String {
-    let status = match status {
-        DecisionStatus::Proposed => "proposed",
-        DecisionStatus::Accepted => "accepted",
-        DecisionStatus::Superseded => "superseded",
-    };
-    let author = match author {
-        Author::Human => "human",
-        Author::Agent => "agent",
-    };
-
-    let mut out = String::new();
-    out.push_str("---\n");
-    out.push_str(&format!("schema_version = {}\n", decision::SUPPORTED_SCHEMA_VERSION));
-    out.push_str(&format!("id = {}\n", toml_string(id)));
-    out.push_str(&format!("title = {}\n", toml_string(args.title.trim())));
-    out.push_str(&format!("status = {}\n", toml_string(status)));
-    out.push_str(&format!(
-        "supersedes = [{}]\n",
-        args.supersedes
-            .as_deref()
-            .map(toml_string)
-            .unwrap_or_default()
-    ));
-    if let Some(task) = &args.task {
-        out.push_str(&format!("task = {}\n", toml_string(task.trim())));
-    }
-    out.push_str(&format!("scope = [{}]\n", toml_array(&args.scope)));
-    out.push_str(&format!("author = {}\n", toml_string(author)));
-    out.push_str(&format!("recorded_at = {}\n", toml_string(&decision::now_rfc3339())));
-    let _ = slug;
-    out.push_str("---\n");
-    out.push_str("## Context\n\n");
-    out.push_str(args.context.as_deref().unwrap_or("").trim());
-    out.push_str("\n\n## Decision\n\n");
-    out.push_str(args.decision.trim());
-    if !args.alternative.is_empty() {
-        out.push_str("\n\n## Alternatives rejected\n\n");
-        for alternative in &args.alternative {
-            out.push_str("- ");
-            out.push_str(alternative.trim());
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// A TOML basic string, with the two escapes that matter and a refusal for
-/// the control characters that would silently mangle a record.
-fn toml_string(value: &str) -> String {
-    let mut out = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str(" "),
-            c if c.is_control() => out.push(' '),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn toml_array(values: &[String]) -> String {
-    values
-        .iter()
-        .map(|value| toml_string(value.trim()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Lowercase kebab-case, the same shape `rule add` file names use: it lands
-/// in `git status` and in agent output.
-fn slugify(text: &str) -> String {
-    let mut slug = String::new();
-    let mut last_was_dash = true;
-    for character in text.chars() {
-        if character.is_ascii_alphanumeric() {
-            slug.push(character.to_ascii_lowercase());
-            last_was_dash = false;
-        } else if !last_was_dash {
-            slug.push('-');
-            last_was_dash = true;
-        }
-        if slug.len() >= 48 {
-            break;
-        }
-    }
-    let slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() {
-        "decision".to_string()
-    } else {
-        slug
-    }
 }
 
 fn list(
@@ -332,7 +211,7 @@ fn list(
         shown += 1;
         println!(
             "{}  [{}]  {}{}",
-            &decision.meta.id[..decision.meta.id.len().min(10)],
+            decision::short_id(&decision.meta.id),
             decision.meta.status.as_str(),
             decision.meta.title,
             if is_superseded { "  (superseded)" } else { "" }
@@ -365,7 +244,7 @@ fn show(root: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
             })
             .unwrap_or(false)
     });
-    let found = match (exact, by_slug) {
+    let found: &Decision = match (exact, by_slug) {
         (Some(found), _) => found,
         (None, Some(found)) => found,
         (None, None) => {
@@ -398,15 +277,19 @@ fn show(root: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         println!("## Alternatives rejected\n\n{}\n", found.alternatives);
     }
     if let Some(path) = &found.path {
-        println!("file: {}", path);
+        println!("file: {}/.archex/decisions/{}", root.display(), path);
     }
     Ok(())
 }
 
 fn first_line(text: &str) -> String {
-    let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
-    if line.len() > 96 {
-        format!("{}…", &line[..96])
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    if line.chars().count() > 96 {
+        let head: String = line.chars().take(96).collect();
+        format!("{}…", head.trim_end())
     } else {
         line.to_string()
     }

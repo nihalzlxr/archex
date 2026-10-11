@@ -10,14 +10,9 @@ fn record(root: &Path, arguments: &str) -> String {
     call_mcp_tool(root, "record_decision", arguments)
 }
 
-const ARGUMENTS: &str = r#"{
-    "title": "Billing writes go through the db module only",
-    "decision": "Route handlers call services; only services import db.",
-    "context": "A feature route imported db directly and broke the rule on day two.",
-    "alternatives": ["let each route own its SQL", "allow db imports in route files with a lint"],
-    "scope": ["db"],
-    "task": "harden-routes"
-}"#;
+/// One line: JSON-RPC here is line-delimited, so a pretty-printed payload
+/// is two broken messages rather than a formatted one.
+const ARGUMENTS: &str = r#"{"title":"Billing writes go through the db module only","decision":"Route handlers call services; only services import db.","context":"A feature route imported db directly and broke the rule on day two.","alternatives":["let each route own its SQL","allow db imports in route files with a lint"],"scope":["db"],"task":"harden-routes"}"#;
 
 /// The exit test of Step 3: an agent logs a decision mid-session, and the
 /// NEXT session starts knowing it. Not the same process, not a manual

@@ -33,6 +33,30 @@ pub struct CheckDriftRequest {
     pub file_path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecordDecisionRequest {
+    #[schemars(description = "One sentence: what was decided")]
+    pub title: String,
+    #[schemars(description = "The decision itself, in one or two sentences")]
+    pub decision: String,
+    #[schemars(description = "Why this came up — what forced the choice")]
+    #[serde(default)]
+    pub context: Option<String>,
+    #[schemars(description = "Options that were rejected and why. Strongly recommended: it is what stops the same question being reopened next month")]
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    #[schemars(description = "Module or layer names this applies to, e.g. [\"db\"]. Omit only if the decision is genuinely global")]
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[schemars(description = "Provenance: the task or branch this came out of")]
+    #[serde(default)]
+    pub task: Option<String>,
+    #[schemars(description = "ULID of the decision this replaces")]
+    #[serde(default)]
+    pub supersedes: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArchexService;
 
@@ -553,6 +577,70 @@ impl ArchexService {
             serde_json::to_string(&result_json).unwrap()
         )]))
     }
+/// Record why the code is the way it is, so the next session starts
+    /// knowing it. Writes a proposed, agent-authored record and nothing
+    /// else: there is deliberately no status or author parameter, because an
+    /// agent cannot accept its own decision.
+    #[tool(description = "Record an architectural decision you made while working, with the alternatives you rejected. Writes .archex/decisions/<ULID>-<slug>.md as status: proposed, author: agent — a human accepts it in review. Scope it with module or layer names so it reaches the files it concerns. Use it when you chose an approach, not for routine changes.")]
+    async fn record_decision(
+        &self,
+        #[tool(aggr)] req: RecordDecisionRequest,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        use crate::core::decision::{self, Author, DecisionStatus, NewDecision};
+
+        let root = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+
+        let supersedes = match &req.supersedes {
+            Some(id) if !decision::is_ulid(id) => {
+                return Ok(tool_error(format!(
+                    "`{}` is not a ULID. `archex decide list` shows them.",
+                    id
+                )));
+            }
+            Some(id) => vec![id.clone()],
+            None => Vec::new(),
+        };
+
+        let new = NewDecision {
+            id: decision::new_ulid(),
+            title: req.title.clone(),
+            decision: req.decision.clone(),
+            context: req.context.clone(),
+            alternatives: req.alternatives.clone(),
+            scope: req.scope.clone(),
+            task: req.task.clone(),
+            // Fixed, not a parameter: agents propose, humans accept.
+            status: DecisionStatus::Proposed,
+            author: Author::Agent,
+            supersedes,
+            recorded_at: decision::now_rfc3339(),
+        };
+
+        match decision::write_new(&root, &new) {
+            Ok(path) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({
+                    "recorded": true,
+                    "id": new.id,
+                    "file": path,
+                    "title": new.title,
+                    "status": "proposed",
+                    "author": "agent",
+                    "next": "Commit it and open a PR. A human accepts it there; until then \
+                             it is served to agents marked as proposed.",
+                }))
+                .unwrap(),
+            )])),
+            Err(error) => Ok(tool_error(format!("{}", error))),
+        }
+    }
+}
+
+/// A failure the agent can read and act on, without the tool call itself
+/// looking like a transport error.
+fn tool_error(message: String) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string(&serde_json::json!({ "error": message })).unwrap(),
+    )])
 }
 
 #[tool(tool_box)]

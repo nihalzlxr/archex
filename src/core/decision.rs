@@ -320,6 +320,12 @@ pub fn is_ulid(value: &str) -> bool {
     bytes.iter().all(|b| ALPHABET.contains(b))
 }
 
+/// The part of a ULID that is safe to show in a list: ULIDs sort by time,
+/// so ten characters is both readable and chronologically useful.
+pub fn short_id(id: &str) -> &str {
+    &id[..id.len().min(10)]
+}
+
 /// A fresh id for a decision written right now: 48-bit millisecond
 /// timestamp, 80 bits of randomness, Crockford base32. Lexical order is
 /// chronological order, so `ls` and `git log` tell you which decision is
@@ -542,6 +548,139 @@ pub fn chain_heads(decisions: &[Decision]) -> Result<Vec<&Decision>, DecisionErr
     // without reading a timestamp format.
     heads.sort_by(|a, b| b.meta.id.cmp(&a.meta.id));
     Ok(heads)
+}
+
+/// A decision about to be written. One shape for both writers — the CLI
+/// and the MCP tool — so a record an agent writes goes through exactly
+/// the validator a human's does.
+#[derive(Debug, Clone)]
+pub struct NewDecision {
+    pub id: String,
+    pub title: String,
+    pub decision: String,
+    pub context: Option<String>,
+    pub alternatives: Vec<String>,
+    pub scope: Vec<String>,
+    pub task: Option<String>,
+    pub status: DecisionStatus,
+    pub author: Author,
+    pub supersedes: Vec<String>,
+    pub recorded_at: String,
+}
+
+/// Render, validate, write. The order matters: a record that only fails at
+/// sync was written by a broken writer.
+pub fn write_new(root: &std::path::Path, new: &NewDecision) -> Result<String, DecisionError> {
+    let slug = slugify(&new.title);
+    let name = format!("{}-{}.md", new.id, slug);
+    let path = root.join(".archex/decisions").join(&name);
+    if path.exists() {
+        return Err(DecisionError(format!(
+            "refusing to overwrite {}",
+            path.display()
+        )));
+    }
+
+    let body = render(new);
+    // Parsed with the same name the file will carry, so the identity check
+    // runs before anything reaches the disk.
+    Decision::parse_named(&name, &body)?;
+
+    std::fs::create_dir_all(root.join(".archex/decisions"))
+        .map_err(|e| DecisionError(format!("cannot create .archex/decisions: {}", e)))?;
+    std::fs::write(&path, &body)
+        .map_err(|e| DecisionError(format!("cannot write {}: {}", path.display(), e)))?;
+
+    Ok(format!(".archex/decisions/{}", name))
+}
+
+/// Canonical on purpose: fixed field order, defaults omitted, so the diff
+/// of a decision is the decision and two machines writing the same record
+/// produce the same bytes.
+pub fn render(new: &NewDecision) -> String {
+    let mut out = String::from("---\n");
+    out.push_str(&format!(
+        "schema_version = {}\n",
+        SUPPORTED_SCHEMA_VERSION
+    ));
+    out.push_str(&format!("id = {}\n", toml_string(&new.id)));
+    out.push_str(&format!("title = {}\n", toml_string(new.title.trim())));
+    out.push_str(&format!(
+        "status = {}\n",
+        toml_string(new.status.as_str())
+    ));
+    out.push_str(&format!(
+        "supersedes = [{}]\n",
+        new.supersedes.iter().map(|id| toml_string(id)).collect::<Vec<_>>().join(", ")
+    ));
+    if let Some(task) = &new.task {
+        out.push_str(&format!("task = {}\n", toml_string(task.trim())));
+    }
+    out.push_str(&format!(
+        "scope = [{}]\n",
+        new.scope
+            .iter()
+            .map(|entry| toml_string(entry.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out.push_str(&format!("author = {}\n", toml_string(new.author.as_str())));
+    out.push_str(&format!("recorded_at = {}\n", toml_string(&new.recorded_at)));
+    out.push_str("---\n");
+    out.push_str("## Context\n\n");
+    out.push_str(new.context.as_deref().unwrap_or("").trim());
+    out.push_str("\n\n## Decision\n\n");
+    out.push_str(new.decision.trim());
+    if !new.alternatives.is_empty() {
+        out.push_str("\n\n## Alternatives rejected\n\n");
+        for alternative in &new.alternatives {
+            out.push_str("- ");
+            out.push_str(alternative.trim());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn toml_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            // Control characters would silently mangle a record; a space is
+            // the least surprising flattening for a one-line field.
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Lowercase kebab-case, the same shape a rule file name takes: it lands
+/// in `git status` and in agent output.
+pub fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = true;
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "decision".to_string()
+    } else {
+        slug
+    }
 }
 
 #[cfg(test)]

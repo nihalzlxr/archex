@@ -123,17 +123,13 @@ fn orphan_scopes(root: &Path, decisions: &[Decision]) -> Vec<String> {
             if !modules.contains(&entry.as_str()) && !layers.contains(&entry.as_str()) {
                 orphans.push(format!(
                     "{}: scope `{}` matches no module or layer",
-                    short_id(&record.meta.id),
+                    decision::short_id(&record.meta.id),
                     entry
                 ));
             }
         }
     }
     orphans
-}
-
-pub fn short_id(id: &str) -> &str {
-    &id[..id.len().min(10)]
 }
 
 /// The brief an agent actually reads. Markdown, so the shape matches the
