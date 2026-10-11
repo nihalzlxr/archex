@@ -130,6 +130,16 @@ pub fn run_gate(strict: bool, update_baseline: bool) -> Result<bool, Box<dyn std
         "  {} external package import(s) — not in this repo, not counted as gaps",
         report.external_packages
     );
+    if report.ambiguous > 0 {
+        println!(
+            "  {} ambiguous import(s) — `@scope/name` that resolved to nothing, so \
+             package-or-alias cannot be told apart:",
+            report.ambiguous
+        );
+        for example in &report.ambiguous_examples {
+            println!("      {}", example);
+        }
+    }
     if report.outside_index > 0 {
         // The most dangerous line in the output. These edges exist and left
         // the graph: a workspace package resolving to its built entry point

@@ -72,6 +72,12 @@ pub struct Coverage {
     /// never will be. Counted apart so they cannot dilute the first-party
     /// number that actually means something.
     pub external_packages: usize,
+    /// `@scope/name` specifiers that did not resolve: an npm package or an
+    /// alias to a directory named `scope`. No syntactic rule can tell,
+    /// and guessing is what the resolver exists to avoid, so this is its
+    /// own bucket instead of being filed under either count.
+    pub ambiguous: usize,
+    pub ambiguous_examples: Vec<String>,
     /// The first few offenders, so "12 imports left the graph" is
     /// actionable rather than a number to shrug at.
     pub outside_index_examples: Vec<String>,
@@ -111,6 +117,8 @@ pub struct BoundaryReport {
     /// module owns. They left the graph, so a rule cannot judge them.
     pub outside_index: usize,
     pub external_packages: usize,
+    pub ambiguous: usize,
+    pub ambiguous_examples: Vec<String>,
     pub outside_index_examples: Vec<String>,
     pub unresolved_examples: Vec<String>,
     /// Rules whose only edges were the ones that left the graph.
@@ -152,6 +160,8 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
         unresolved_imports: coverage.unresolved_imports,
         outside_index: coverage.outside_index,
         external_packages: coverage.external_packages,
+        ambiguous: coverage.ambiguous,
+        ambiguous_examples: coverage.ambiguous_examples.clone(),
         outside_index_examples: coverage.outside_index_examples.clone(),
         unresolved_examples: coverage.unresolved_examples.clone(),
         ..Default::default()
@@ -279,16 +289,25 @@ fn collect_edges(db: &Db) -> Result<(Vec<Edge>, Coverage), ConfigError> {
         {
             let Some(target) = import.resolved_to else {
                 // `react` is not in this repository and never will be.
-                // Calling that an unclassified import would bury the
-                // first-party gaps under a hundred lines of npm.
-                if import.kind == ImportKind::Package {
-                    coverage.external_packages += 1;
-                } else {
-                    coverage.unresolved_imports += 1;
-                    Coverage::example(
-                        &mut coverage.unresolved_examples,
-                        format!("{}: {}", file, import.imported_from),
-                    );
+                // Calling that a gap would bury the first-party ones under
+                // a hundred lines of npm, and calling a scoped specifier
+                // either way would be a guess.
+                match specifier_home(&import.imported_from) {
+                    SpecifierHome::External => coverage.external_packages += 1,
+                    SpecifierHome::FirstParty => {
+                        coverage.unresolved_imports += 1;
+                        Coverage::example(
+                            &mut coverage.unresolved_examples,
+                            format!("{}: {}", file, import.imported_from),
+                        );
+                    }
+                    SpecifierHome::Ambiguous => {
+                        coverage.ambiguous += 1;
+                        Coverage::example(
+                            &mut coverage.ambiguous_examples,
+                            format!("{}: {}", file, import.imported_from),
+                        );
+                    }
                 }
                 continue;
             };
@@ -390,6 +409,39 @@ pub fn is_test_file(path: &str, globs: &[String]) -> bool {
 pub fn matches_any(path: &str, globs: &[String]) -> bool {
     let compiled = compile(globs);
     compiled.iter().any(|p| matches_pattern(p, path))
+}
+
+/// Where an unresolved specifier points, by shape alone.
+#[derive(Debug, PartialEq, Eq)]
+enum SpecifierHome {
+    /// `./x`, `../x`, `/x`, `@/x`, `~/x`, `#x` — first-party by convention.
+    FirstParty,
+    /// `react`, `next/server`, `drizzle-orm` — a bare specifier, which is
+    /// only ever a package name.
+    External,
+    /// `@scope/name` — a scoped package, or an alias to a directory called
+    /// `scope`. Both spellings are in real codebases.
+    Ambiguous,
+}
+
+fn specifier_home(specifier: &str) -> SpecifierHome {
+    let trimmed = specifier.trim();
+    if trimmed.is_empty() {
+        return SpecifierHome::Ambiguous;
+    }
+    if trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("@/")
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with('#')
+    {
+        return SpecifierHome::FirstParty;
+    }
+    if trimmed.starts_with('@') && trimmed[1..].contains('/') {
+        return SpecifierHome::Ambiguous;
+    }
+    SpecifierHome::External
 }
 
 /// How many edges crossed this rule's two sides and then left the graph.
