@@ -1,14 +1,14 @@
 # archex v2 — Master Plan
 
-Status: Steps 0–2 shipped · Step 2.5 next · Last updated: 2026-10-10
+Status: Steps 0–3.9 shipped · Step 3.10 next · Last updated: 2026-11-03
 
-> Steps 0, 1 and 2 are built, tested and verified on two real repos
+> Steps 0, 1, 2, 2.5, 3, 3.6, 3.7, 3.8, 3.9 are built, tested and verified on two real repos
 > (`project/fitness`, and LORB — the deployment target). The build order and
 > exit tests in §11 are unchanged; §12.1 records the decisions taken while
 > building, including the two places the frozen plan turned out to be wrong.
 > §18 is the verified competitive landscape (researched 2026-10-10); §19
-> folds its steals into the remaining steps. **Step 2.5** (§11) is the next
-> task: one source of truth for rules, before the ledger. `RESUME.md` is
+> folds its steals into the remaining steps. **Step 3.10** (§11) is the next
+> task: `init --draft` mining conventions + templates. `RESUME.md` is
 > the handoff for whoever picks this up next.
 
 ---
@@ -292,8 +292,8 @@ Ordered by cost, not by appeal:
 |---|---|---|---|
 | **3.6** | **Three defects fixed.** Python/Rust imports are extracted with `module_id: 0` and destroyed by the foreign key (error discarded with `.ok()`); `.tsx` is parsed with the non-JSX grammar and loses symbols; `is_route_file` reads the absolute path and its `&&`/`||` precedence makes `/app/api/` match helpers | Each defect has a failing test that fails for its own reason | ✅ done — 246 tests. A **fourth** bug surfaced during the fix: Rust `use` declarations were never extracted at all (the grammar field is `argument`, not `tree`), so the FK bug was hiding behind it |
 | **3.7** | **`get_context` serves committed rules.** The rules table died in 2.5; this caller was left joining it and answering `rules: []` — which reads to an agent as "nothing applies here", and is what a pre-edit hook would inject before every edit | `get_context` returns the governing rule with its message, and nothing for a file it does not govern | ✅ done |
-| **3.8** | **`proposed` means report-only.** Today `is_active()` is `status != Retired`, so a draft rule fails CI before anyone agreed to it. Proposed = reported and counted, accepted = enforced | A proposed rule that matches is reported and `check` exits 0; accepted exits 1 | 🔴 **next** |
-| **3.9** | **The forced loop.** PreToolUse injects the file's rules + decisions; PostToolUse runs the local verification the agent must pass before finishing (`archex check --file-path`, type check, tests). Hooks ship as plain CLIs (`archex hook pre-edit <file>` / `post-edit`) that `setup --agent` wires per agent — fail open, always, once per file per content hash | An agent that never calls a tool still receives the rules before editing | ⬜ |
+| **3.8** | **`proposed` means report-only.** Today `is_active()` is `status != Retired`, so a draft rule fails CI before anyone agreed to it. Proposed = reported and counted, accepted = enforced | A proposed rule that matches is reported and `check` exits 0; accepted exits 1 | ✅ done — `tests/rule_matching.rs::proposed_rule_reports_but_exits_zero_accepted_enforces` |
+| **3.9** | **The forced loop.** PreToolUse injects the file's rules + decisions; PostToolUse runs the local verification the agent must pass before finishing (`archex check --file-path`, type check, tests). Hooks ship as plain CLIs (`archex hook pre-edit <file>` / `post-edit`) that `setup --agent` wires per agent — fail open, always, once per file per content hash | An agent that never calls a tool still receives the rules before editing | ✅ done — `src/cli/hook.rs`, `tests/hook_cli.rs` (5 tests), opencode wiring in `setup.rs` |
 | **3.10** | **`init --draft`.** Candidate modules and rules from evidence, each citing where it came from. Two sources: **mined** — your own conventions (38/41 route files import zod) — and **templates**, because mining cannot teach what the code does not already do | `archex init --draft` on a monorepo produces reviewed proposals with cited evidence and zero TOML typed by hand | ⬜ |
 | **3.11** | **`archex map`** — the tree, `--diff`, and a Mermaid projection. The tree is the source; a diagram is a read-only projection of it, never hand-maintained | A human can see their architecture and what drifted since they accepted it | ⬜ |
 | **3.12** | **`archex review`** — batched accept/reject, writing allowed-crossing records. Agent never answers: a crossing is recorded `pending` and answered in the PR, because an agent has no authority over intent | A rejected proposal never returns | ⬜ |
