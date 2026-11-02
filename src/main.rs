@@ -40,6 +40,10 @@ enum Commands {
         #[command(subcommand)]
         command: cli::decide::DecideCommands,
     },
+    Hook {
+        #[command(subcommand)]
+        command: cli::hook::HookCommands,
+    },
 }
 
 #[tokio::main]
@@ -91,6 +95,12 @@ async fn main() {
         }
         Commands::Decide { command } => {
             if let Err(e) = cli::decide::run(command) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Hook { command } => {
+            if let Err(e) = cli::hook::run(command) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

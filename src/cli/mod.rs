@@ -5,3 +5,4 @@ pub mod check;
 pub mod rule;
 pub mod sync;
 pub mod decide;
+pub mod hook;

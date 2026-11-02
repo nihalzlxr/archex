@@ -96,6 +96,25 @@ fn setup_opencode(binary_path: &str, project_root: &str) -> anyhow::Result<()> {
                 }),
             );
         }
+
+        // Add hooks for pre-edit and post-edit
+        let hooks = obj.entry("hooks").or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if let Some(hooks_obj) = hooks.as_object_mut() {
+            hooks_obj.insert(
+                "pre_edit".to_string(),
+                serde_json::json!({
+                    "command": [binary_path, "hook", "pre-edit", "{file}"],
+                    "cwd": project_root
+                }),
+            );
+            hooks_obj.insert(
+                "post_edit".to_string(),
+                serde_json::json!({
+                    "command": [binary_path, "hook", "post-edit", "{file}"],
+                    "cwd": project_root
+                }),
+            );
+        }
     }
 
     let json = serde_json::to_string_pretty(&config)?;
@@ -132,6 +151,12 @@ fn setup_cursor(binary_path: &str, project_root: &str) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(&config)?;
     fs::write(config_path, json)?;
 
+    // Cursor doesn't have native pre/post edit hooks, but we can add them to the mcp config as tools
+    // For now, just note that hooks need manual setup for Cursor
+    println!("Note: Cursor requires manual hook setup. Add these to your Cursor settings:");
+    println!("  Pre-edit: {} hook pre-edit {{file}}", binary_path);
+    println!("  Post-edit: {} hook post-edit {{file}}", binary_path);
+
     Ok(())
 }
 
@@ -165,6 +190,11 @@ fn setup_claude(binary_path: &str) -> anyhow::Result<()> {
 
     let json = serde_json::to_string_pretty(&config)?;
     fs::write(config_path, json)?;
+
+    // Claude Code uses bash hooks - print instructions
+    println!("Note: For Claude Code, add these to your shell config or project .claude/hooks:");
+    println!("  Pre-edit: {} hook pre-edit \"$FILE\"", binary_path);
+    println!("  Post-edit: {} hook post-edit \"$FILE\"", binary_path);
 
     Ok(())
 }
