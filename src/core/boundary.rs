@@ -227,6 +227,10 @@ pub fn check(db: &Db, config: &Config, rules: &[Rule]) -> Result<BoundaryReport,
         }
 
         for edge in candidates {
+            // Proposed rules are reported (rule_status) but do not generate findings.
+            if !rule.is_enforced() {
+                continue;
+            }
             if !boundary.include_tests && is_test_file(&edge.from_file, &test_globs) {
                 continue;
             }

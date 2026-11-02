@@ -276,6 +276,11 @@ impl Rule {
         self.status != Status::Retired
     }
 
+    /// Only accepted rules are enforced. Proposed rules are reported but do not fail the build.
+    pub fn is_enforced(&self) -> bool {
+        self.status == Status::Accepted
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != SUPPORTED_SCHEMA_VERSION {
             return Err(ConfigError(format!(
